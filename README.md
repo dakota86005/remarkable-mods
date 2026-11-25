@@ -14,9 +14,14 @@ This is a personal repository. It is not part of the official Vellum package ind
 | `note-links` | 2.0.0 | Links and spot tags between notebook pages, with backlinks and a links graph |
 | `hide-home-logo` | 2.0.0 | Hides the reMarkable wordmark in the home header |
 | `system-info` | 1.0.0 | System panel in the home menu |
+| `sudoku` | 1.0.0 | Sudoku app for AppLoad: puzzles made on the tablet, handwriting read on the device |
 
-All of them depend on `qt-resource-rebuilder` from the official Vellum repo, and are limited to
+The home screen and notebook mods depend on `qt-resource-rebuilder` from the official Vellum repo, and are limited to
 `remarkable-os>=3.29 <3.30`. After an install, upgrade or removal, the reMarkable UI restarts once by itself.
+
+`sudoku` is different: it is an AppLoad app, not a patch, so it needs AppLoad, is not tied to a firmware version,
+and is not part of `setup.sh`. Install it with `vellum add sudoku@dakota`, then open AppLoad and tap **Reload**.
+No restart happens on install. `vellum purge sudoku` also deletes the saved puzzle.
 
 ## One-time setup on the tablet
 
