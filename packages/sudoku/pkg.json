@@ -1,4 +1,4 @@
-{"pkgname": "sudoku", "pkgver": "1.0.4", "pkgrel": 0,
+{"pkgname": "sudoku", "pkgver": "1.0.5", "pkgrel": 0,
  "pkgdesc": "Sudoku for AppLoad: puzzles made on the tablet, digits written with the Marker and read on the device.",
  "license": "custom", "url": "https://github.com/dakota86005/remarkable-mods",
  "depends": ["!rm1", "!rm2"]}
