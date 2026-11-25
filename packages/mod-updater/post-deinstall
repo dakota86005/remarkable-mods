@@ -1,0 +1,3 @@
+#!/bin/sh
+[ "$VELLUM_PURGE" = "1" ] && rm -rf /home/root/.local/share/mod-updater
+exit 0

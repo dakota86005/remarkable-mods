@@ -1,0 +1,5 @@
+#!/bin/sh
+mkdir -p /home/root/.local/share/mod-updater
+# AppLoad keeps the old app loaded until the UI restarts
+@RESTART@
+exit 0

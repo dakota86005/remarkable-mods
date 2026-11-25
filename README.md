@@ -14,6 +14,7 @@ This is a personal repository. It is not part of the official Vellum package ind
 | `note-links` | 2.0.0 | Links and spot tags between notebook pages, with backlinks and a links graph |
 | `hide-home-logo` | 2.0.0 | Hides the reMarkable wordmark in the home header |
 | `system-info` | 1.0.0 | System panel in the home menu |
+| `mod-updater` | 1.0.0 | **Mods**, an AppLoad app to browse, install, update and remove mods on the tablet (this repo and the official Vellum repo) |
 | `sudoku` | 1.0.2 | Sudoku app for AppLoad: puzzles made on the tablet, handwriting read on the device |
 
 The home screen and notebook mods depend on `qt-resource-rebuilder` from the official Vellum repo, and are limited to
@@ -48,6 +49,24 @@ From then on:
 These mods don't appear on reManager's Discover or Search pages, which show only the official catalog.
 
 The `@dakota` tag pins them to this repo, so an official package with the same name can't replace them.
+
+## Mods app (no terminal needed after this)
+
+Install it once from reManager's terminal, then open AppLoad, tap **Reload** and tap **Mods**:
+
+```sh
+vellum add mod-updater@dakota
+```
+
+- **Installed** lists everything Vellum installed, with the ones that have updates first. *Update all* runs `vellum upgrade`.
+- **Discover** lists every mod in this repo and in the official Vellum repo that isn't installed yet. Mods made for other
+  reMarkable versions are hidden (tap *Show … for other versions* at the bottom to see them).
+- Tap a mod for details, *Install*, *Update*, *Remove* or *Remove with data* (`vellum purge`).
+- *Check now* runs `vellum update` and refreshes both lists. Mods checks by itself when the lists are more than 6 hours old.
+
+Changes run as their own systemd unit, not inside the reMarkable UI, so when a mod restarts the UI after installing
+(which closes Mods), the install still finishes. Open Mods again to see how it went. The app's source is in
+`apps/mod-updater/` (`build.sh` rebuilds it into `packages/mod-updater/`).
 
 ## Undo the setup
 ```sh
