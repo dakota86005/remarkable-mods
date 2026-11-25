@@ -30,6 +30,7 @@
 #define MSG_STATUS 2      /* text for the app's diagnostics line */
 #define MSG_STROKE 3      /* "e;x,y,x,y,..." a finished stroke; e is 1 for the eraser end */
 #define MSG_DOWN 4        /* "x,y" the Marker has just touched the screen */
+#define MSG_NEAR 5        /* "1" either end of the Marker is within reach of the screen, "0" not */
 #define MAX_POINTS 5000
 #define SYS_TERMINATE (-1)
 #define SYS_NEW_FRONTEND (-2)
@@ -114,7 +115,7 @@ static int rubber_now(int fd) {
 int main(int argc, char **argv) {
     struct sockaddr_un addr;
     char name[96] = "";
-    int dev = -1, rubber = 0, idle = 0;
+    int dev = -1, rubber = 0, idle = 0, tip = 0, near = 0;
     int ax = 0, ay = 0, have = 0, touch = 0, was = 0, stroke_rubber = 0;
 
     signal(SIGPIPE, SIG_IGN);
@@ -161,12 +162,14 @@ int main(int argc, char **argv) {
                 np = 0; was = 0;
                 say(MSG_STATUS, dev >= 0 ? name : "no Marker device");
                 say(MSG_ERASER, rubber ? "1" : "0");
+                say(MSG_NEAR, near ? "1" : "0");
             }
         }
 
         if (dev >= 0 && (p[1].revents & (POLLHUP | POLLERR | POLLNVAL))) {
             close(dev); dev = -1; idle = 1;
             if (rubber) { rubber = 0; say(MSG_ERASER, "0"); }
+            tip = 0; if (near) { near = 0; say(MSG_NEAR, "0"); }
             continue;
         }
         if (dev >= 0 && (p[1].revents & POLLIN)) {
@@ -176,6 +179,7 @@ int main(int argc, char **argv) {
                 if (got < 0 && (errno == EAGAIN || errno == EINTR)) continue;
                 close(dev); dev = -1; idle = 1;
                 if (rubber) { rubber = 0; say(MSG_ERASER, "0"); }
+            tip = 0; if (near) { near = 0; say(MSG_NEAR, "0"); }
                 continue;
             }
             for (size_t i = 0; i < (size_t) got / sizeof ev[0]; i++) {
@@ -187,13 +191,17 @@ int main(int argc, char **argv) {
                     if (code == BTN_TOOL_RUBBER) {
                         int now = value ? 1 : 0;
                         if (now != rubber) { rubber = now; say(MSG_ERASER, rubber ? "1" : "0"); }
-                    } else if (code == BTN_TOUCH) touch = value ? 1 : 0;
+                    } else if (code == BTN_TOOL_PEN) tip = value ? 1 : 0;
+                    else if (code == BTN_TOUCH) touch = value ? 1 : 0;
                 } else if (type == EV_SYN && code == SYN_DROPPED) {
                     /* Events were lost: drop the stroke in progress rather than guess. */
                     int now = rubber_now(dev);
                     if (now != rubber) { rubber = now; say(MSG_ERASER, rubber ? "1" : "0"); }
-                    touch = was = 0; np = 0;
+                    touch = was = 0; np = 0; tip = 0;
+                    if (near != now) { near = now; say(MSG_NEAR, near ? "1" : "0"); }
                 } else if (type == EV_SYN && code == SYN_REPORT) {
+                    int reach = (tip || rubber || touch) ? 1 : 0;
+                    if (reach != near) { near = reach; say(MSG_NEAR, near ? "1" : "0"); }
                     if (touch && have == 3) {
                         int x = norm(ax, max_x), y = norm(ay, max_y);
                         if (!was) {
