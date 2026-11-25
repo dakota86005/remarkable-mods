@@ -14,6 +14,7 @@ This is a personal repository. It is not part of the official Vellum package ind
 | `note-links` | 2.0.0 | Links and spot tags between notebook pages, with backlinks and a links graph |
 | `hide-home-logo` | 2.0.0 | Hides the reMarkable wordmark in the home header |
 | `system-info` | 1.0.0 | System panel in the home menu |
+| `up-next` | 1.0.0 | Your next calendar event in the home header, from an .ics link, with a saved copy for offline |
 | `mod-updater` | 1.0.0 | **Mods**, an AppLoad app to browse, install, update and remove mods on the tablet (this repo and the official Vellum repo) |
 | `sudoku` | 1.2.0 | Sudoku app for AppLoad: puzzles made on the tablet, handwriting read on the device |
 
@@ -67,6 +68,15 @@ vellum add mod-updater@dakota
 Changes run as their own systemd unit, not inside the reMarkable UI, so when a mod restarts the UI after installing
 (which closes Mods), the install still finishes. Open Mods again to see how it went. The app's source is in
 `apps/mod-updater/` (`build.sh` rebuilds it into `packages/mod-updater/`).
+
+## Up Next (calendar)
+
+`up-next` puts the next event from one or more calendar feeds (.ics or webcal:// links) in the home header, to the
+right of Field Weather. Tap it for its menu: the next few events, *Show in the header* (every day or weekdays only),
+*Look ahead* (today, 3 days, a week), all-day events on or off, and the list of calendars. Add a link in the menu, or
+append links, one per line, to `/home/root/.local/share/upnext/links.txt` (read and emptied the next time the menu
+opens). The feed is read in a background thread and the next two months are saved in `cache.json`, so it keeps
+showing your events without Wi-Fi. Links stay on the tablet. `vellum purge up-next` also deletes the saved links and copy.
 
 ## Undo the setup
 ```sh
