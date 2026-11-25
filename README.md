@@ -15,7 +15,7 @@ This is a personal repository. It is not part of the official Vellum package ind
 | `hide-home-logo` | 2.0.0 | Hides the reMarkable wordmark in the home header |
 | `system-info` | 1.0.0 | System panel in the home menu |
 | `mod-updater` | 1.0.0 | **Mods**, an AppLoad app to browse, install, update and remove mods on the tablet (this repo and the official Vellum repo) |
-| `sudoku` | 1.0.3 | Sudoku app for AppLoad: puzzles made on the tablet, handwriting read on the device |
+| `sudoku` | 1.0.4 | Sudoku app for AppLoad: puzzles made on the tablet, handwriting read on the device |
 
 The home screen and notebook mods depend on `qt-resource-rebuilder` from the official Vellum repo, and are limited to
 `remarkable-os>=3.29 <3.30`. After an install, upgrade or removal, the reMarkable UI restarts once by itself.
