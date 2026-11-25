@@ -1,0 +1,8 @@
+{
+    "id": "sudoku",
+    "name": "Sudoku",
+    "loadsBackend": false,
+    "entry": "/ui/main.qml",
+    "supportsScaling": true,
+    "canHaveMultipleFrontends": false
+}
