@@ -1,0 +1,4 @@
+{"pkgname": "mod-updater", "pkgver": "1.0.0", "pkgrel": 0,
+ "pkgdesc": "Mods for AppLoad: browse, install, update and remove Vellum mods from the tablet, including this repo's.",
+ "license": "custom", "url": "https://github.com/dakota86005/remarkable-mods",
+ "depends": ["!rm1", "!rm2"]}

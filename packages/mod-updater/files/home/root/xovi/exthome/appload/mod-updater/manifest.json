@@ -1,0 +1,8 @@
+{
+    "id": "mod-updater",
+    "name": "Mods",
+    "loadsBackend": true,
+    "entry": "/ui/main.qml",
+    "supportsScaling": true,
+    "canHaveMultipleFrontends": false
+}
