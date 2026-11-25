@@ -1,0 +1,3 @@
+#!/bin/sh
+@RESTART@
+exit 0

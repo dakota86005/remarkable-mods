@@ -1,0 +1,4 @@
+#!/bin/sh
+[ "$VELLUM_PURGE" = "1" ] && rm -rf /home/root/.local/share/sysinfo
+@RESTART@
+exit 0

@@ -1,0 +1,4 @@
+{"pkgname": "note-links", "pkgver": "2.0.0", "pkgrel": 0,
+ "pkgdesc": "Links and spot tags between notebook pages, with backlinks and a links graph.",
+ "license": "custom", "url": "https://github.com/dakota86005/remarkable-mods",
+ "depends": ["qt-resource-rebuilder", "!rm1", "!rm2", "remarkable-os>=3.29", "remarkable-os<3.30"]}

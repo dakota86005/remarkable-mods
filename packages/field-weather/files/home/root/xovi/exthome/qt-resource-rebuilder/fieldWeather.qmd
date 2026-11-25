@@ -1,0 +1,640 @@
+; Field Weather - v4 (fail-soft: 20 s watchdog, clear status, keeps last reading)
+; Home screen header weather: current conditions with icon (left of logo).
+; Refreshes when Wi-Fi connects, on wake, and every 30 min; location editable on the tablet.
+;   Tap readout          -> refresh now
+;   Press and hold       -> change location
+; Data: Open-Meteo forecast + geocoding (no API key).
+; Settings file: /home/root/.local/share/fieldweather.json
+; Target firmware: 3.29.1.0 (hashtab 3.29.1.0)
+; Logs: journalctl -u xochitl --since "-15min" | grep fieldWeather
+; Remove: delete this file from /home/root/xovi/exthome/qt-resource-rebuilder/ and restart xovi.
+
+; /qml/device/view/navigator/ContentHeader.qml
+AFFECT [[16664384747789373392]]
+    ; xofm.libs.controls (GeneralTextInput, the on-screen-keyboard text field)
+    IMPORT [[6504469795.6504031891.7712892662059645]] 1.0
+
+    ; FocusScope#header
+    TRAVERSE ?#[[7082729395218]]
+
+        LOCATE AFTER ALL INSERT {
+            Item {
+                id: fieldWeather
+                anchors.fill: parent
+
+                readonly property string cfgPath: "file:///home/root/.local/share/fieldweather.json"
+                property real lat: 33.4255
+                property real lon: -111.9400
+                property string place: "Tempe"
+                property string nowTemp: "--"
+                property string nowWord: "Weather"
+                property string nowKind: "cloud"
+                property string detail: "Loading…"
+                property bool editing: false
+
+                function kindFor(code, isDay) {
+                    if (code === 0 || code === 1) return isDay ? "sun" : "moon";
+                    if (code === 2) return isDay ? "partly" : "cloud";
+                    if (code === 3) return "cloud";
+                    if (code === 45 || code === 48) return "fog";
+                    if (code >= 51 && code <= 57) return "drizzle";
+                    if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return "rain";
+                    if ((code >= 71 && code <= 77) || code === 85 || code === 86) return "snow";
+                    if (code >= 95) return "storm";
+                    return "cloud";
+                }
+
+                function wordFor(code) {
+                    if (code === 0) return "Clear";
+                    if (code === 1) return "Mostly clear";
+                    if (code === 2) return "Partly cloudy";
+                    if (code === 3) return "Overcast";
+                    if (code === 45 || code === 48) return "Fog";
+                    if (code >= 51 && code <= 57) return "Drizzle";
+                    if (code >= 61 && code <= 67) return "Rain";
+                    if (code >= 71 && code <= 77) return "Snow";
+                    if (code >= 80 && code <= 82) return "Showers";
+                    if (code === 85 || code === 86) return "Snow showers";
+                    if (code >= 95) return "Thunderstorms";
+                    return "—";
+                }
+
+                // ---- status / logging
+                property int reqSeq: 0
+                property var pending: null
+                property bool usedHttp: false
+                property int failCount: 0
+                property real lastGood: 0
+                property string lastGoodDetail: ""
+
+                function log(msg) {
+                    console.log("[fieldWeather] " + msg);
+                }
+
+                function clock(t) {
+                    var hh = t.getHours() % 12 || 12;
+                    return hh + ":" + ("0" + t.getMinutes()).slice(-2);
+                }
+
+                // Show the failure but keep the last good reading on screen
+                function fail(reason) {
+                    failCount = failCount + 1;
+                    log("refresh failed: " + reason + " (fail #" + failCount + ")");
+                    if (lastGood > 0) {
+                        detail = reason + " · showing " + clock(new Date(lastGood)) + " · tap to retry";
+                    } else {
+                        detail = reason + " · tap to retry";
+                    }
+                    if (failCount <= 3) fieldWeatherRetry.restart();
+                }
+
+                function loadConfig() {
+                    var done = false;
+                    function finish() {
+                        if (done) return;
+                        done = true;
+                        fieldWeatherCfgGuard.stop();
+                        fieldWeather.refresh();
+                    }
+                    fieldWeatherCfgGuard.doneFn = finish;
+                    fieldWeatherCfgGuard.restart();
+                    try {
+                        var req = new XMLHttpRequest();
+                        req.open("GET", cfgPath);
+                        req.onreadystatechange = function() {
+                            if (req.readyState !== XMLHttpRequest.DONE) return;
+                            try {
+                                if (req.responseText) {
+                                    var c = JSON.parse(req.responseText);
+                                    if (typeof c.lat === "number" && typeof c.lon === "number") {
+                                        fieldWeather.lat = c.lat;
+                                        fieldWeather.lon = c.lon;
+                                        fieldWeather.place = c.place || "";
+                                    }
+                                    var l = c.last;
+                                    if (l && typeof l.at === "number" && l.temp && fieldWeather.lastGood === 0) {
+                                        fieldWeather.nowTemp = l.temp;
+                                        fieldWeather.nowWord = l.word || "Weather";
+                                        fieldWeather.nowKind = l.kind || "cloud";
+                                        fieldWeather.lastGood = l.at;
+                                        fieldWeather.lastGoodDetail = l.detail || "";
+                                        fieldWeather.detail = "Updating… (last " + fieldWeather.clock(new Date(l.at)) + ")";
+                                    }
+                                }
+                            } catch (e) {
+                                fieldWeather.log("settings file unreadable, using defaults: " + e);
+                            }
+                            finish();
+                        };
+                        req.send();
+                    } catch (e) {
+                        log("settings read threw: " + e);
+                        finish();
+                    }
+                }
+
+                function saveConfig() {
+                    try {
+                        var o = { lat: lat, lon: lon, place: place };
+                        if (lastGood > 0) {
+                            o.last = { temp: nowTemp, word: nowWord, kind: nowKind, detail: lastGoodDetail, at: lastGood };
+                        }
+                        var req = new XMLHttpRequest();
+                        req.open("PUT", cfgPath);
+                        req.send(JSON.stringify(o));
+                    } catch (e) {
+                        log("settings write threw: " + e);
+                    }
+                }
+
+                property real lastFetch: 0
+
+                // Automatic triggers: skip when offline or fetched within the last 2 minutes
+                function autoRefresh() {
+                    if (typeof LinkProvider !== "undefined" && LinkProvider.isOnline === false) return;
+                    if (Date.now() - lastFetch < 120000) return;
+                    refresh();
+                }
+
+                // Watchdog fired: drop the request and say so
+                function timedOut() {
+                    var seq = reqSeq;
+                    reqSeq = reqSeq + 1;
+                    var r = pending;
+                    pending = null;
+                    try { if (r) r.abort(); } catch (e) {}
+                    if (usedHttp === false) {
+                        // HTTPS hung: try once more over plain HTTP before giving up
+                        log("no response over https after 20 s (req " + seq + "), trying http");
+                        refresh(true);
+                        return;
+                    }
+                    fail("No response");
+                }
+
+                function refresh(plainHttp) {
+                    lastFetch = Date.now();
+                    fieldWeatherRetry.stop();
+                    if (pending) {
+                        try { pending.abort(); } catch (e) {}
+                        pending = null;
+                    }
+                    reqSeq = reqSeq + 1;
+                    var seq = reqSeq;
+                    usedHttp = plainHttp === true;
+                    if (typeof LinkProvider !== "undefined" && LinkProvider.isOnline === false) {
+                        log("LinkProvider says offline; trying anyway");
+                    }
+                    try {
+                        var url = (usedHttp ? "http" : "https") + "://api.open-meteo.com/v1/forecast?latitude=" + lat
+                            + "&longitude=" + lon
+                            + "&current=temperature_2m,weather_code,is_day"
+                            + "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+                            + "&temperature_unit=fahrenheit&timezone=auto&forecast_days=1";
+                        log("req " + seq + " GET " + url);
+                        var req = new XMLHttpRequest();
+                        req.open("GET", url);
+                        req.onreadystatechange = function() {
+                            if (req.readyState !== XMLHttpRequest.DONE) return;
+                            if (seq !== fieldWeather.reqSeq) return;   // stale (timed out or superseded)
+                            fieldWeatherWatchdog.stop();
+                            fieldWeather.pending = null;
+                            fieldWeather.handle(req, seq);
+                        };
+                        pending = req;
+                        fieldWeatherWatchdog.restart();
+                        req.send();
+                    } catch (e) {
+                        fieldWeatherWatchdog.stop();
+                        pending = null;
+                        fail("Weather error");
+                        log("refresh threw: " + e);
+                    }
+                }
+
+                function handle(req, seq) {
+                    var st = req.status;
+                    log("req " + seq + " done, status " + st + ", " + (req.responseText ? req.responseText.length : 0) + " bytes");
+                    if (st === 0) {
+                        if (usedHttp === false) {
+                            log("https failed with status 0, trying http");
+                            refresh(true);
+                            return;
+                        }
+                        var off = typeof LinkProvider !== "undefined" && LinkProvider.isOnline === false;
+                        fail(off ? "Offline" : "Can't reach server");
+                        return;
+                    }
+                    if (st !== 200) {
+                        fail("Server error " + st);
+                        return;
+                    }
+                    try {
+                        var j = JSON.parse(req.responseText);
+                        var d = j.daily;
+                        nowTemp = Math.round(j.current.temperature_2m) + "°";
+                        nowWord = wordFor(j.current.weather_code);
+                        nowKind = kindFor(j.current.weather_code, j.current.is_day === 1);
+                        var t = new Date();
+                        var rain = d.precipitation_probability_max[0];
+                        lastGoodDetail = "H " + Math.round(d.temperature_2m_max[0]) + "°  L "
+                            + Math.round(d.temperature_2m_min[0]) + "°  ·  "
+                            + (rain === null || rain === undefined ? "--" : rain) + "% rain  ·  "
+                            + place + " " + clock(t);
+                        detail = lastGoodDetail;
+                        lastGood = t.getTime();
+                        failCount = 0;
+                        saveConfig();
+                    } catch (e) {
+                        log("bad response: " + e + " / " + ("" + req.responseText).slice(0, 200));
+                        fail("Bad data");
+                    }
+                }
+
+                function searchPlaces(q) {
+                    if (!q || !q.trim()) return;
+                    fieldWeatherEditor.status = "Searching…";
+                    fieldWeatherEditor.results = [];
+                    var req = new XMLHttpRequest();
+                    req.open("GET", "https://geocoding-api.open-meteo.com/v1/search?count=5&language=en&format=json&name="
+                        + encodeURIComponent(q.trim()));
+                    req.onreadystatechange = function() {
+                        if (req.readyState !== XMLHttpRequest.DONE) return;
+                        try {
+                            var r = JSON.parse(req.responseText).results || [];
+                            fieldWeatherEditor.results = r;
+                            fieldWeatherEditor.status = r.length ? "Tap a result" : "No matches";
+                        } catch (e) {
+                            fieldWeatherEditor.status = "Search failed · check Wi-Fi";
+                        }
+                    };
+                    req.send();
+                }
+
+                function choosePlace(r) {
+                    lat = r.latitude;
+                    lon = r.longitude;
+                    place = r.name;
+                    lastGood = 0;
+                    failCount = 0;
+                    saveConfig();
+                    editing = false;
+                    detail = "Loading…";
+                    refresh();
+                }
+
+                Component.onCompleted: loadConfig()
+
+                // Aborts a weather request that hangs (no reply, no error)
+                Timer {
+                    id: fieldWeatherWatchdog
+                    interval: 20000
+                    repeat: false
+                    onTriggered: fieldWeather.timedOut()
+                }
+
+                // Settings file read never finished: fetch with defaults anyway
+                Timer {
+                    id: fieldWeatherCfgGuard
+                    interval: 5000
+                    repeat: false
+                    property var doneFn: null
+                    onTriggered: {
+                        fieldWeather.log("settings read timed out");
+                        if (doneFn) doneFn();
+                    }
+                }
+
+                // After a failure, try again in 60 s (up to 3 times; taps always work)
+                Timer {
+                    id: fieldWeatherRetry
+                    interval: 60000
+                    repeat: false
+                    onTriggered: fieldWeather.refresh()
+                }
+
+                Timer {
+                    interval: 1800000
+                    running: true
+                    repeat: true
+                    onTriggered: fieldWeather.autoRefresh()
+                }
+
+                // Wi-Fi came up: fetch as soon as the connection is usable
+                Timer {
+                    id: fieldWeatherOnline
+                    interval: 1500
+                    repeat: false
+                    onTriggered: fieldWeather.autoRefresh()
+                }
+
+                Connections {
+                    target: LinkProvider
+                    function onIsOnlineChanged() {
+                        if (LinkProvider.isOnline) fieldWeatherOnline.restart();
+                    }
+                }
+
+                // Woke from sleep: fetch now if Wi-Fi is already up; otherwise the
+                // Wi-Fi handler above picks it up when the connection returns
+                Connections {
+                    target: BatteryManager
+                    function onDisplayStateChanged(previous, next) {
+                        var wasAsleep = previous === BatteryManager.DeepSleep || previous === BatteryManager.LightSleep;
+                        if (wasAsleep && next === BatteryManager.Normal) {
+                            fieldWeatherOnline.restart();
+                        }
+                    }
+                }
+
+                // Weather icon drawn with Canvas; used through Loaders that set iconKind / iconStroke
+                Component {
+                    id: fieldWeatherIconComp
+                    Canvas {
+                    anchors.fill: parent
+                    property string kind: parent ? parent.iconKind : "cloud"
+                    property real stroke: parent ? parent.iconStroke : 3
+                    onKindChanged: requestPaint()
+                    onWidthChanged: requestPaint()
+
+                    function cloud(c, ox, oy) {
+                        c.beginPath();
+                        c.moveTo(ox + 12, oy + 38);
+                        c.arc(ox + 12, oy + 31, 7, Math.PI * 0.5, Math.PI * 1.5, false);
+                        c.arc(ox + 23, oy + 24, 10, Math.PI * 1.08, Math.PI * 1.92, false);
+                        c.arc(ox + 34, oy + 31, 7, Math.PI * 1.5, Math.PI * 0.5, false);
+                        c.closePath();
+                        c.fillStyle = "white";
+                        c.fill();
+                        c.stroke();
+                        c.fillStyle = "black";
+                    }
+
+                    function sun(c, cx, cy, r, ray) {
+                        c.beginPath();
+                        c.arc(cx, cy, r, 0, Math.PI * 2, false);
+                        c.stroke();
+                        for (var i = 0; i < 8; i++) {
+                            var a = i * Math.PI / 4;
+                            c.beginPath();
+                            c.moveTo(cx + Math.cos(a) * (r + 3), cy + Math.sin(a) * (r + 3));
+                            c.lineTo(cx + Math.cos(a) * (r + 3 + ray), cy + Math.sin(a) * (r + 3 + ray));
+                            c.stroke();
+                        }
+                    }
+
+                    onPaint: {
+                        var c = getContext("2d");
+                        c.reset();
+                        c.scale(width / 48, height / 48);
+                        c.lineWidth = stroke;
+                        c.lineCap = "round";
+                        c.lineJoin = "round";
+                        c.strokeStyle = "black";
+                        c.fillStyle = "black";
+                        var i;
+                        if (kind === "sun") {
+                            sun(c, 24, 24, 9, 6);
+                        } else if (kind === "moon") {
+                            c.beginPath();
+                            c.arc(24, 24, 14, 0, Math.PI * 2, false);
+                            c.fill();
+                            c.beginPath();
+                            c.fillStyle = "white";
+                            c.arc(31, 18, 12, 0, Math.PI * 2, false);
+                            c.fill();
+                        } else if (kind === "partly") {
+                            sun(c, 30, 15, 6, 4);
+                            cloud(c, -3, 4);
+                        } else if (kind === "cloud") {
+                            cloud(c, 0, 0);
+                        } else if (kind === "fog") {
+                            var ys = [14, 22, 30, 38];
+                            var xs = [[8, 40], [4, 34], [12, 44], [6, 30]];
+                            for (i = 0; i < 4; i++) {
+                                c.beginPath();
+                                c.moveTo(xs[i][0], ys[i]);
+                                c.lineTo(xs[i][1], ys[i]);
+                                c.stroke();
+                            }
+                        } else {
+                            cloud(c, 0, -7);
+                            if (kind === "rain") {
+                                for (i = 0; i < 3; i++) {
+                                    c.beginPath();
+                                    c.moveTo(16 + i * 8, 36);
+                                    c.lineTo(12 + i * 8, 45);
+                                    c.stroke();
+                                }
+                            } else if (kind === "drizzle") {
+                                for (i = 0; i < 3; i++) {
+                                    c.beginPath();
+                                    c.arc(14 + i * 9, 40 + (i % 2) * 4, 1.6, 0, Math.PI * 2, false);
+                                    c.fill();
+                                }
+                            } else if (kind === "snow") {
+                                for (i = 0; i < 3; i++) {
+                                    var sx = 13 + i * 11, sy = 42;
+                                    for (var k = 0; k < 3; k++) {
+                                        var a = k * Math.PI / 3;
+                                        c.beginPath();
+                                        c.moveTo(sx - Math.cos(a) * 4, sy - Math.sin(a) * 4);
+                                        c.lineTo(sx + Math.cos(a) * 4, sy + Math.sin(a) * 4);
+                                        c.stroke();
+                                    }
+                                }
+                            } else if (kind === "storm") {
+                                c.beginPath();
+                                c.moveTo(28, 27);
+                                c.lineTo(16, 40);
+                                c.lineTo(23, 40);
+                                c.lineTo(18, 48);
+                                c.lineTo(33, 34);
+                                c.lineTo(26, 34);
+                                c.closePath();
+                                c.fillStyle = "black";
+                                c.fill();
+                            }
+                        }
+                    }
+                }
+                }
+
+                // Current conditions, left of the logo
+                Item {
+                    id: fieldWeatherNow
+                    anchors.left: parent.left
+                    anchors.leftMargin: menuButton.width + 20
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 520
+                    height: parent.height
+
+                    Loader {
+                        id: fieldWeatherNowIcon
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 60
+                        height: 60
+                        property string iconKind: fieldWeather.nowKind
+                        property real iconStroke: 3
+                        sourceComponent: fieldWeatherIconComp
+                    }
+
+                    Column {
+                        anchors.left: fieldWeatherNowIcon.right
+                        anchors.leftMargin: 16
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 4
+
+                        Text {
+                            width: 440
+                            elide: Text.ElideRight
+                            text: fieldWeather.nowTemp + "  " + fieldWeather.nowWord
+                            color: "black"
+                            font.pixelSize: Values.fontSizeH2
+                            font.weight: Font.DemiBold
+                        }
+
+                        Text {
+                            width: 440
+                            elide: Text.ElideRight
+                            text: fieldWeather.detail
+                            color: "black"
+                            font.pixelSize: 22
+                            font.weight: Font.Medium
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        pressAndHoldInterval: 700
+                        onClicked: {
+                            fieldWeather.detail = "Refreshing…";
+                            fieldWeather.failCount = 0;
+                            fieldWeather.refresh();
+                        }
+                        onPressAndHold: {
+                            fieldWeatherEditor.results = [];
+                            fieldWeatherEditor.status = "Type a city, then press Enter";
+                            fieldWeatherInput.text = "";
+                            fieldWeather.editing = true;
+                            fieldWeatherInput.forceActiveFocus();
+                        }
+                    }
+                }
+
+                // Location editor, drawn over the file grid
+                Rectangle {
+                    id: fieldWeatherEditor
+                    parent: header.parent
+                    visible: fieldWeather.editing
+                    z: 1000
+                    x: 0
+                    y: header.height
+                    width: header.width
+                    height: 640
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    property var results: []
+                    property string status: ""
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Column {
+                        anchors.fill: parent
+                        anchors.margins: 48
+                        spacing: 24
+
+                        Text {
+                            text: "Weather location"
+                            color: "black"
+                            font.pixelSize: Values.fontSizeH1
+                            font.weight: Font.DemiBold
+                        }
+
+                        Rectangle {
+                            width: parent.width
+                            height: 80
+                            color: "white"
+                            border.color: "black"
+                            border.width: 2
+
+                            GeneralTextInput {
+                                id: fieldWeatherInput
+                                anchors.fill: parent
+                                anchors.leftMargin: 20
+                                anchors.rightMargin: 20
+                                verticalAlignment: TextInput.AlignVCenter
+                                font.pixelSize: Values.fontSizeH2
+                                color: "black"
+                                selectedTextColor: "white"
+                                selectionColor: "black"
+                                inputMethodHints: Qt.ImhNoPredictiveText
+                                onAccepted: fieldWeather.searchPlaces(text)
+                            }
+                        }
+
+                        Text {
+                            text: fieldWeatherEditor.status
+                            color: "black"
+                            font.pixelSize: 22
+                        }
+
+                        Column {
+                            width: parent.width
+                            spacing: 0
+
+                            Repeater {
+                                model: fieldWeatherEditor.results
+                                delegate: Rectangle {
+                                    width: parent.width
+                                    height: 64
+                                    color: "white"
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: modelData.name
+                                            + (modelData.admin1 ? ", " + modelData.admin1 : "")
+                                            + (modelData.country_code ? " · " + modelData.country_code : "")
+                                        color: "black"
+                                        font.pixelSize: Values.fontSizeBody2
+                                    }
+                                    Rectangle {
+                                        anchors.bottom: parent.bottom
+                                        width: parent.width
+                                        height: 1
+                                        color: "black"
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: fieldWeather.choosePlace(modelData)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        anchors.margins: 40
+                        text: "Cancel"
+                        color: "black"
+                        font.pixelSize: Values.fontSizeH2
+                        font.weight: Font.DemiBold
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -24
+                            onClicked: fieldWeather.editing = false
+                        }
+                    }
+                }
+            }
+        }
+
+    END TRAVERSE
+
+END AFFECT

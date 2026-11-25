@@ -1,0 +1,1100 @@
+; systemInfo - v1
+; "System" entry in the home hamburger menu (above Trash). Opens a full-screen
+; panel: memory, processor (total + per core, load, frequency), storage,
+; battery (charge, status, health, cycles, voltage, current, power, capacity,
+; temperature), temperature sensors, uptime, firmware, kernel.
+;
+; Battery: nothing runs in the background unless logging is switched On.
+;   - Panel open: reads /proc and /sys every 2, 5 or 15 s (your choice).
+;     Live refresh pauses by itself after 10 idle minutes.
+;   - Panel closed + logging Off: no timers at all.
+;   - Logging On: one sample every 1, 5 or 15 min appended to log.csv
+;     (last 4000 rows kept). Switching Off stops the timer immediately.
+;     The setting survives restarts. The menu entry says "Logging on" while it runs.
+; Files: /home/root/.local/share/sysinfo/settings.json, log.csv, paths.json
+; Reads /proc and /sys with XMLHttpRequest (xovi sets QML_XHR_ALLOW_FILE_READ/WRITE).
+; Coexists with noteLinks (also patches Sidebar.qml, after Tags), Nave, fieldWeather, hideHomeLogo.
+; qmldiff note: binding values never start with "(" or contain "!"; checked with tools/qmd_lint.py.
+; Target firmware: 3.29.1.0 (hashtab 3.29.1.0)
+; Remove: delete systemInfo.qmd from /home/root/xovi/exthome/qt-resource-rebuilder/ and run /home/root/xovi/start.
+
+AFFECT [[4911547370760691430]]
+    TRAVERSE [[8397993708429497603]]
+        LOCATE AFTER ALL
+        INSERT {
+            // ================= systemInfo: panel =================
+            Item {
+                id: siPanel
+                parent: root.parent
+                anchors.fill: parent
+                z: 905
+                visible: false
+
+                readonly property string serif: "EB Garamond"
+                readonly property string ink: "#000000"
+                readonly property string dataUrl: "file:///home/root/.local/share/sysinfo/"
+                readonly property int maxRows: 4000
+                readonly property string csvHeader: "epoch,time,battery_pct,battery_status,voltage_v,current_ma,battery_temp_c,cpu_temp_c,cpu_pct,load1,mem_used_pct"
+
+                property var settings: { return { logging: false, logMinutes: 5, refreshSec: 5 }; }
+                property bool settingsLoaded: false
+
+                // probing (once per app start)
+                property bool probed: false
+                property bool probing: false
+                property var probeWaiters: []
+                property string battDir: ""
+                property var zones: []
+                property string firmware: ""
+                property string kernel: ""
+                property bool procOk: true
+
+                // live panel
+                property var prevCpu: null
+                property var colA: []
+                property var colB: []
+                property string uptimeText: ""
+                property string updatedText: ""
+                property bool paused: false
+
+                // log
+                property var logRows: []
+                property bool logLoaded: false
+                property bool logLoading: false
+                property var logPrevCpu: null
+                property string logStatus: ""
+                property double lastLogAt: 0
+                property bool clearArmed: false
+
+                // ---------- files ----------
+                function readFile(path, cb) {
+                    const xhr = new XMLHttpRequest();
+                    xhr.onreadystatechange = function () {
+                        if (xhr.readyState === XMLHttpRequest.DONE) {
+                            const t = xhr.responseText;
+                            cb(t && t.length > 0 ? String(t) : null);
+                        }
+                    };
+                    try {
+                        xhr.open("GET", "file://" + path);
+                        xhr.send();
+                    } catch (e) {
+                        cb(null);
+                    }
+                }
+
+                function readMany(paths, cb) {
+                    const out = ({});
+                    let pending = paths.length;
+                    if (pending === 0) {
+                        cb(out);
+                        return;
+                    }
+                    paths.forEach(function (p) {
+                        siPanel.readFile(p, function (t) {
+                            out[p] = t;
+                            pending--;
+                            if (pending === 0) cb(out);
+                        });
+                    });
+                }
+
+                function writeData(name, text, cb) {
+                    const xhr = new XMLHttpRequest();
+                    xhr.onreadystatechange = function () {
+                        if (xhr.readyState === XMLHttpRequest.DONE) {
+                            if (cb) cb(xhr.status === 0 || (xhr.status >= 200 && xhr.status < 300));
+                        }
+                    };
+                    try {
+                        xhr.open("PUT", siPanel.dataUrl + name);
+                        xhr.send(text);
+                    } catch (e) {
+                        if (cb) cb(false);
+                    }
+                }
+
+                function saveSettings() {
+                    siPanel.writeData("settings.json", JSON.stringify(siPanel.settings), null);
+                }
+
+                function setSetting(key, value) {
+                    const s = Object.assign({}, siPanel.settings);
+                    s[key] = value;
+                    siPanel.settings = s;
+                    siPanel.saveSettings();
+                }
+
+                // ---------- parsing ----------
+                function kv(text, sep) {
+                    const out = ({});
+                    if (text === null) return out;
+                    text.split("\n").forEach(function (line) {
+                        const i = line.indexOf(sep);
+                        if (i > 0) out[line.substring(0, i).trim()] = line.substring(i + 1).trim();
+                    });
+                    return out;
+                }
+
+                function words(line) {
+                    return String(line).split("\t").join(" ").split(" ").filter(function (w) { return w.length > 0; });
+                }
+
+                function num(s) {
+                    if (s === undefined || s === null) return NaN;
+                    return parseFloat(String(s));
+                }
+
+                function parseStat(text) {
+                    const r = { all: null, cores: [], running: NaN, procs: NaN };
+                    if (text === null) return r;
+                    text.split("\n").forEach(function (line) {
+                        const f = siPanel.words(line);
+                        if (f.length > 4 && f[0].indexOf("cpu") === 0) {
+                            let total = 0;
+                            for (let i = 1; i < Math.min(f.length, 9); i++) total += parseInt(f[i]) || 0;
+                            const idle = (parseInt(f[4]) || 0) + (parseInt(f[5]) || 0);
+                            if (f[0] === "cpu") r.all = [idle, total];
+                            else r.cores.push([idle, total]);
+                        } else if (f[0] === "procs_running") {
+                            r.running = parseInt(f[1]);
+                        }
+                    });
+                    return r;
+                }
+
+                function usage(prev, cur) {
+                    if (prev === null || prev === undefined || cur === null || cur === undefined) return NaN;
+                    const dt = cur[1] - prev[1];
+                    const di = cur[0] - prev[0];
+                    if (dt <= 0) return NaN;
+                    return Math.max(0, Math.min(1, 1 - di / dt));
+                }
+
+                // ---------- formatting ----------
+                function gb(kb) {
+                    if (isNaN(kb)) return "n/a";
+                    if (kb >= 1048576) return (kb / 1048576).toFixed(2) + " GB";
+                    return Math.round(kb / 1024) + " MB";
+                }
+
+                function pct(f) {
+                    if (isNaN(f)) return "n/a";
+                    return Math.round(f * 100) + " %";
+                }
+
+                function temp(c) {
+                    if (isNaN(c)) return "n/a";
+                    return c.toFixed(1) + " °C  ·  " + Math.round(c * 9 / 5 + 32) + " °F";
+                }
+
+                function duration(sec) {
+                    if (isNaN(sec)) return "n/a";
+                    const d = Math.floor(sec / 86400);
+                    const h = Math.floor((sec % 86400) / 3600);
+                    const m = Math.floor((sec % 3600) / 60);
+                    if (d > 0) return d + (d === 1 ? " day " : " days ") + h + " h";
+                    if (h > 0) return h + " h " + m + " min";
+                    return m + " min";
+                }
+
+                function two(n) {
+                    return (n < 10 ? "0" : "") + n;
+                }
+
+                function clock(dt) {
+                    return two(dt.getHours()) + ":" + two(dt.getMinutes());
+                }
+
+                function stamp(dt) {
+                    return dt.getFullYear() + "-" + two(dt.getMonth() + 1) + "-" + two(dt.getDate()) + " " + clock(dt);
+                }
+
+                function zoneName(t) {
+                    let s = String(t || "zone").replace("-thermal", "").replace("_thermal", "").replace("-", " ").replace("_", " ");
+                    if (s.toLowerCase() === "cpu") return "Processor";
+                    return s.charAt(0).toUpperCase() + s.substring(1);
+                }
+
+                // ---------- probing ----------
+                function probe(cb) {
+                    if (siPanel.probed) {
+                        cb();
+                        return;
+                    }
+                    siPanel.probeWaiters.push(cb);
+                    if (siPanel.probing) return;
+                    siPanel.probing = true;
+                    siPanel.readFile("/home/root/.local/share/sysinfo/paths.json", function (t) {
+                        let cands = [];
+                        try {
+                            const p = JSON.parse(t);
+                            if (p && p.battery) cands.push(String(p.battery));
+                        } catch (e) {}
+                        ["max1726x_battery", "max77818_battery", "max170xx_battery", "max17201_battery", "bq27441-0", "battery", "BAT0"].forEach(function (n) {
+                            cands.push("/sys/class/power_supply/" + n);
+                        });
+                        siPanel.probeBattery(cands, 0);
+                    });
+                }
+
+                function probeBattery(cands, i) {
+                    if (i >= cands.length) {
+                        siPanel.battDir = "";
+                        siPanel.probeZones(0, []);
+                        return;
+                    }
+                    siPanel.readFile(cands[i] + "/uevent", function (t) {
+                        if (t && t.indexOf("POWER_SUPPLY_CAPACITY=") >= 0) {
+                            siPanel.battDir = cands[i];
+                            siPanel.probeZones(0, []);
+                        } else {
+                            siPanel.probeBattery(cands, i + 1);
+                        }
+                    });
+                }
+
+                function probeZones(i, acc) {
+                    const base = "/sys/class/thermal/thermal_zone" + i;
+                    siPanel.readMany([base + "/temp", base + "/type"], function (r) {
+                        if (r[base + "/temp"] === null || i > 9) {
+                            siPanel.zones = acc;
+                            siPanel.probeStatic();
+                        } else {
+                            acc.push({ path: base + "/temp", name: siPanel.zoneName(r[base + "/type"]) });
+                            siPanel.probeZones(i + 1, acc);
+                        }
+                    });
+                }
+
+                function probeStatic() {
+                    siPanel.readMany(["/etc/os-release", "/proc/sys/kernel/osrelease"], function (r) {
+                        const os = siPanel.kv(r["/etc/os-release"], "=");
+                        siPanel.firmware = String(os.IMG_VERSION || os.VERSION_ID || "n/a").split("\"").join("");
+                        siPanel.kernel = r["/proc/sys/kernel/osrelease"] ? r["/proc/sys/kernel/osrelease"].trim() : "n/a";
+                        siPanel.probed = true;
+                        siPanel.probing = false;
+                        const w = siPanel.probeWaiters;
+                        siPanel.probeWaiters = [];
+                        w.forEach(function (f) { f(); });
+                    });
+                }
+
+                // ---------- sampling ----------
+                function sample(cb) {
+                    siPanel.probe(function () {
+                        const paths = ["/proc/stat", "/proc/meminfo", "/proc/loadavg", "/proc/uptime", "/proc/self/status",
+                                       "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"];
+                        if (siPanel.battDir.length > 0) paths.push(siPanel.battDir + "/uevent");
+                        siPanel.zones.forEach(function (z) { paths.push(z.path); });
+                        siPanel.readMany(paths, function (r) {
+                            const s = {};
+                            s.ok = r["/proc/meminfo"] ? true : false;
+                            s.stat = siPanel.parseStat(r["/proc/stat"]);
+                            s.mem = siPanel.kv(r["/proc/meminfo"], ":");
+                            const la = siPanel.words(r["/proc/loadavg"] || "");
+                            s.load = [siPanel.num(la[0]), siPanel.num(la[1]), siPanel.num(la[2])];
+                            s.procs = la.length > 3 ? String(la[3]) : "";
+                            s.uptime = siPanel.num((r["/proc/uptime"] || "").split(" ")[0]);
+                            s.self = siPanel.kv(r["/proc/self/status"], ":");
+                            s.freq = siPanel.num(r["/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"]);
+                            s.batt = siPanel.battDir.length > 0 ? siPanel.kv(r[siPanel.battDir + "/uevent"], "=") : ({});
+                            s.temps = siPanel.zones.map(function (z) {
+                                return { name: z.name, c: siPanel.num(r[z.path]) / 1000 };
+                            });
+                            cb(s);
+                        });
+                    });
+                }
+
+                function memKb(s, k) {
+                    return siPanel.num(String(s.mem[k] || "").split(" ")[0]);
+                }
+
+                function battVal(s, k) {
+                    return siPanel.num(s.batt["POWER_SUPPLY_" + k]);
+                }
+
+                function battStr(s, k) {
+                    const v = s.batt["POWER_SUPPLY_" + k];
+                    return v === undefined ? "" : String(v);
+                }
+
+                function cpuTemp(s) {
+                    if (s.temps.length === 0) return NaN;
+                    return s.temps[0].c;
+                }
+
+                // ---------- live panel ----------
+                function open() {
+                    siPanel.paused = false;
+                    siPanel.prevCpu = null;
+                    siPanel.clearArmed = false;
+                    siPanel.visible = true;
+                    siIdle.restart();
+                    siPanel.ensureLog(function () { siChart.requestPaint(); });
+                }
+
+                function close() {
+                    siPanel.visible = false;
+                    siPanel.prevCpu = null;
+                }
+
+                function touch() {
+                    if (siPanel.paused) {
+                        siPanel.paused = false;
+                    }
+                    siIdle.restart();
+                }
+
+                function refresh() {
+                    siPanel.sample(function (s) {
+                        if (siPanel.visible === false) return;
+                        siPanel.build(s);
+                    });
+                }
+
+                function build(s) {
+                    siPanel.procOk = s.ok;
+                    const prev = siPanel.prevCpu;
+                    const total = siPanel.usage(prev ? prev.all : null, s.stat.all);
+                    const cores = s.stat.cores.map(function (c, i) {
+                        return ["Core " + (i + 1), siPanel.usage(prev && prev.cores[i] ? prev.cores[i] : null, c)];
+                    });
+                    siPanel.prevCpu = s.stat;
+
+                    // memory
+                    const mt = siPanel.memKb(s, "MemTotal");
+                    const ma = siPanel.memKb(s, "MemAvailable");
+                    const used = mt - ma;
+                    const memRows = [
+                        ["Used", siPanel.gb(used) + " of " + siPanel.gb(mt)],
+                        ["Available", siPanel.gb(ma)],
+                        ["Cached", siPanel.gb(siPanel.memKb(s, "Cached"))],
+                        ["Notebook app", siPanel.gb(siPanel.num(String(s.self.VmRSS || "").split(" ")[0]))]
+                    ];
+                    const st = siPanel.memKb(s, "SwapTotal");
+                    if (st > 0) memRows.push(["Swap used", siPanel.gb(st - siPanel.memKb(s, "SwapFree")) + " of " + siPanel.gb(st)]);
+
+                    // processor
+                    const cpuRows = [
+                        ["Load (1 · 5 · 15 min)", s.load.map(function (x) { return isNaN(x) ? "–" : x.toFixed(2); }).join("  ·  ")],
+                        ["Frequency", isNaN(s.freq) ? "n/a" : Math.round(s.freq / 1000) + " MHz"],
+                        ["Processes", s.procs.length > 0 ? s.procs.replace("/", " running of ") : "n/a"]
+                    ];
+
+                    // storage
+                    let sUsed = NaN;
+                    let sTotal = NaN;
+                    try {
+                        if (typeof SystemMonitor === "object" || typeof SystemMonitor === "function") {
+                            sUsed = Number(SystemMonitor.storageUsed);
+                            sTotal = Number(SystemMonitor.storageTotal);
+                        }
+                    } catch (e) {}
+                    const storRows = [
+                        ["Used", siPanel.gb(sUsed / 1024)],
+                        ["Free", siPanel.gb((sTotal - sUsed) / 1024)],
+                        ["Total", siPanel.gb(sTotal / 1024)]
+                    ];
+
+                    siPanel.colA = [
+                        { t: "MEMORY", m: mt > 0 ? used / mt : NaN, mt: siPanel.pct(mt > 0 ? used / mt : NaN) + " used", rows: memRows, bars: [] },
+                        { t: "PROCESSOR", m: total, mt: isNaN(total) ? "measuring…" : siPanel.pct(total) + " busy", rows: cpuRows, bars: cores },
+                        { t: "STORAGE", m: sTotal > 0 ? sUsed / sTotal : NaN, mt: sTotal > 0 ? siPanel.pct(sUsed / sTotal) + " used" : "n/a", rows: storRows, bars: [] }
+                    ];
+
+                    // battery
+                    let battRows = [];
+                    let cap = NaN;
+                    if (siPanel.battDir.length > 0) {
+                        cap = siPanel.battVal(s, "CAPACITY");
+                        const v = siPanel.battVal(s, "VOLTAGE_NOW") / 1e6;
+                        const i = siPanel.battVal(s, "CURRENT_NOW") / 1000;
+                        const full = siPanel.battVal(s, "CHARGE_FULL");
+                        const design = siPanel.battVal(s, "CHARGE_FULL_DESIGN");
+                        let health = siPanel.battStr(s, "HEALTH");
+                        if (full > 0 && design > 0) health = Math.round(full / design * 100) + " % of new" + (health.length > 0 ? "  ·  " + health : "");
+                        battRows = [
+                            ["Status", siPanel.battStr(s, "STATUS") || "n/a"],
+                            ["Health", health.length > 0 ? health : "n/a"],
+                            ["Charge cycles", isNaN(siPanel.battVal(s, "CYCLE_COUNT")) ? "n/a" : String(siPanel.battVal(s, "CYCLE_COUNT"))],
+                            ["Voltage", isNaN(v) ? "n/a" : v.toFixed(3) + " V"],
+                            ["Current", isNaN(i) ? "n/a" : Math.round(i) + " mA"],
+                            ["Power", isNaN(v) || isNaN(i) ? "n/a" : (Math.abs(v * i) / 1000).toFixed(2) + " W"],
+                            ["Capacity", full > 0 ? Math.round(full / 1000) + (design > 0 ? " of " + Math.round(design / 1000) : "") + " mAh" : "n/a"],
+                            ["Temperature", siPanel.temp(siPanel.battVal(s, "TEMP") / 10)]
+                        ];
+                    } else {
+                        battRows = [["Battery", "not found (see INSTALL)"]];
+                    }
+
+                    // temperature
+                    const tRows = s.temps.map(function (z) { return [z.name, siPanel.temp(z.c)]; });
+                    if (tRows.length === 0) tRows.push(["Sensors", "none found"]);
+
+                    // device
+                    const devRows = [
+                        ["Uptime", siPanel.duration(s.uptime)],
+                        ["Firmware", siPanel.firmware],
+                        ["Kernel", siPanel.kernel]
+                    ];
+
+                    siPanel.colB = [
+                        { t: "BATTERY", m: isNaN(cap) ? NaN : cap / 100, mt: isNaN(cap) ? "n/a" : cap + " %", rows: battRows, bars: [] },
+                        { t: "TEMPERATURE", m: NaN, mt: "", rows: tRows, bars: [] },
+                        { t: "DEVICE", m: NaN, mt: "", rows: devRows, bars: [] }
+                    ];
+                    siPanel.uptimeText = "Up " + siPanel.duration(s.uptime);
+                    siPanel.updatedText = "Updated " + siPanel.clock(new Date());
+                }
+
+                // ---------- logging ----------
+                function ensureLog(cb) {
+                    if (siPanel.logLoaded) {
+                        cb();
+                        return;
+                    }
+                    siPanel.readFile("/home/root/.local/share/sysinfo/log.csv", function (t) {
+                        let rows = [];
+                        if (t) {
+                            rows = t.split("\n").filter(function (l) { return l.length > 0 && l.indexOf("epoch") < 0; });
+                        }
+                        if (rows.length > siPanel.maxRows) rows = rows.slice(rows.length - siPanel.maxRows);
+                        siPanel.logRows = rows;
+                        siPanel.logLoaded = true;
+                        cb();
+                    });
+                }
+
+                function setLogging(on) {
+                    siPanel.touch();
+                    if (on === siPanel.settings.logging) return;
+                    siPanel.logPrevCpu = null;
+                    siPanel.setSetting("logging", on);
+                    if (on) siPanel.logTick();
+                    else siPanel.logStatus = "Logging off. Nothing runs while this panel is closed.";
+                }
+
+                function logTick() {
+                    if (siPanel.settings.logging === false) return;
+                    siPanel.ensureLog(function () {
+                        siPanel.sample(function (s) {
+                            if (siPanel.settings.logging === false) return;
+                            const now = new Date();
+                            const cpu = siPanel.usage(siPanel.logPrevCpu, s.stat.all);
+                            siPanel.logPrevCpu = s.stat.all;
+                            const mt = siPanel.memKb(s, "MemTotal");
+                            const ma = siPanel.memKb(s, "MemAvailable");
+                            const f = function (x, d) { return isNaN(x) ? "" : x.toFixed(d); };
+                            const row = [
+                                Math.round(now.getTime() / 1000),
+                                siPanel.stamp(now),
+                                f(siPanel.battVal(s, "CAPACITY"), 0),
+                                siPanel.battStr(s, "STATUS").replace(",", " "),
+                                f(siPanel.battVal(s, "VOLTAGE_NOW") / 1e6, 3),
+                                f(siPanel.battVal(s, "CURRENT_NOW") / 1000, 0),
+                                f(siPanel.battVal(s, "TEMP") / 10, 1),
+                                f(siPanel.cpuTemp(s), 1),
+                                f(cpu * 100, 1),
+                                f(s.load[0], 2),
+                                f(mt > 0 ? (mt - ma) / mt * 100 : NaN, 1)
+                            ].join(",");
+                            let rows = siPanel.logRows.concat([row]);
+                            if (rows.length > siPanel.maxRows) rows = rows.slice(rows.length - siPanel.maxRows);
+                            siPanel.logRows = rows;
+                            siPanel.lastLogAt = now.getTime();
+                            siPanel.writeData("log.csv", siPanel.csvHeader + "\n" + rows.join("\n") + "\n", function (ok) {
+                                siPanel.logStatus = ok ? "Last sample " + siPanel.clock(now) + "  ·  " + rows.length + " rows"
+                                                       : "Could not write the log. Run the install script once.";
+                            });
+                            if (siPanel.visible) siChart.requestPaint();
+                        });
+                    });
+                }
+
+                function clearLog() {
+                    siPanel.touch();
+                    if (siPanel.clearArmed === false) {
+                        siPanel.clearArmed = true;
+                        siClearReset.restart();
+                        return;
+                    }
+                    siPanel.clearArmed = false;
+                    siPanel.logRows = [];
+                    siPanel.logLoaded = true;
+                    siPanel.writeData("log.csv", siPanel.csvHeader + "\n", function (ok) {
+                        siPanel.logStatus = ok ? "Log cleared." : "Could not write the log.";
+                    });
+                    siChart.requestPaint();
+                }
+
+                Component.onCompleted: {
+                    siPanel.readFile("/home/root/.local/share/sysinfo/settings.json", function (t) {
+                        try {
+                            const p = JSON.parse(t);
+                            if (p) siPanel.settings = Object.assign({}, siPanel.settings, p);
+                        } catch (e) {}
+                        siPanel.settingsLoaded = true;
+                        if (siPanel.settings.logging) siPanel.logTick();
+                    });
+                }
+
+                // Live refresh: only while the panel is open and not idle-paused.
+                Timer {
+                    id: siTick
+                    interval: Math.max(2, siPanel.settings.refreshSec) * 1000
+                    repeat: true
+                    triggeredOnStart: true
+                    running: { return siPanel.visible && siPanel.paused === false; }
+                    onTriggered: siPanel.refresh()
+                }
+
+                // Safety net: stop live refresh after 10 idle minutes.
+                Timer {
+                    id: siIdle
+                    interval: 600000
+                    running: { return siPanel.visible && siPanel.paused === false; }
+                    onTriggered: siPanel.paused = true
+                }
+
+                // Logging: only when switched on. Stops as soon as it is switched off.
+                Timer {
+                    id: siLogTimer
+                    interval: Math.max(1, siPanel.settings.logMinutes) * 60000
+                    repeat: true
+                    running: siPanel.settingsLoaded && siPanel.settings.logging
+                    onTriggered: siPanel.logTick()
+                }
+
+                Timer {
+                    id: siClearReset
+                    interval: 4000
+                    onTriggered: siPanel.clearArmed = false
+                }
+
+                // ---------- UI ----------
+                Rectangle {
+                    anchors.fill: parent
+                    color: "white"
+                }
+
+                // swallow taps so nothing underneath reacts
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: siPanel.touch()
+                }
+
+                // top bar
+                Item {
+                    id: siBar
+                    width: parent.width
+                    height: 120
+
+                    Text {
+                        x: 48
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "‹  Close"
+                        color: siPanel.ink
+                        font.family: siPanel.serif
+                        font.pixelSize: 36
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -24
+                            onClicked: siPanel.close()
+                        }
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "SYSTEM"
+                        color: siPanel.ink
+                        font.family: siPanel.serif
+                        font.pixelSize: 30
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 10
+                    }
+
+                    Row {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 48
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 0
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Refresh  "
+                            color: siPanel.ink
+                            font.family: siPanel.serif
+                            font.pixelSize: 26
+                            font.italic: true
+                        }
+                        Repeater {
+                            model: [2, 5, 15]
+                            delegate: Rectangle {
+                                required property var modelData
+                                readonly property bool on: siPanel.settings.refreshSec === modelData
+                                width: 96
+                                height: 56
+                                color: on ? siPanel.ink : "white"
+                                border.width: 2
+                                border.color: siPanel.ink
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData + " s"
+                                    color: parent.on ? "white" : siPanel.ink
+                                    font.family: siPanel.serif
+                                    font.pixelSize: 26
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        siPanel.touch();
+                                        siPanel.setSetting("refreshSec", modelData);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        anchors.bottom: parent.bottom
+                        width: parent.width
+                        height: 2
+                        color: siPanel.ink
+                    }
+                }
+
+                Flickable {
+                    id: siFlick
+                    anchors.top: siBar.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    contentWidth: width
+                    contentHeight: siContent.height + 80
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    onMovementStarted: siPanel.touch()
+
+                    Item {
+                        id: siContent
+                        width: siFlick.width
+                        height: siLog.y + siLog.height
+
+                        // headline
+                        Text {
+                            id: siHead
+                            x: 60
+                            y: 40
+                            text: siPanel.uptimeText
+                            color: siPanel.ink
+                            font.family: siPanel.serif
+                            font.pixelSize: 64
+                        }
+                        Text {
+                            anchors.right: parent.right
+                            anchors.rightMargin: 60
+                            anchors.baseline: siHead.baseline
+                            text: {
+                                if (siPanel.procOk === false) return "Cannot read /proc on this firmware";
+                                if (siPanel.paused) return "Paused to save battery  ·  tap to resume";
+                                return siPanel.updatedText;
+                            }
+                            color: siPanel.ink
+                            font.family: siPanel.serif
+                            font.pixelSize: 28
+                            font.italic: true
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -20
+                                onClicked: {
+                                    siPanel.touch();
+                                    siPanel.refresh();
+                                }
+                            }
+                        }
+                        Rectangle {
+                            id: siHeadRule
+                            x: 60
+                            y: 140
+                            width: parent.width - 120
+                            height: 2
+                            color: siPanel.ink
+                        }
+
+                        Row {
+                            id: siCols
+                            x: 60
+                            y: 180
+                            spacing: 120
+                        Repeater {
+                            model: 2
+                            delegate: Column {
+                                id: siCol
+                                required property int index
+                                readonly property var secs: index === 0 ? siPanel.colA : siPanel.colB
+                                width: 690
+                                spacing: 56
+
+                                Repeater {
+                                    model: siCol.secs.length
+                                    delegate: Column {
+                                        id: siSec
+                                        required property int index
+                                        readonly property var sec: siCol.secs[index] || ({ t: "", m: NaN, mt: "", rows: [], bars: [] })
+                                        width: siCol.width
+                                        spacing: 14
+
+                                        Item {
+                                            width: parent.width
+                                            height: 40
+                                            Text {
+                                                anchors.left: parent.left
+                                                anchors.bottom: parent.bottom
+                                                text: siSec.sec.t
+                                                color: siPanel.ink
+                                                font.family: siPanel.serif
+                                                font.pixelSize: 26
+                                                font.weight: Font.DemiBold
+                                                font.letterSpacing: 8
+                                            }
+                                            Text {
+                                                anchors.right: parent.right
+                                                anchors.bottom: parent.bottom
+                                                text: siSec.sec.mt
+                                                color: siPanel.ink
+                                                font.family: siPanel.serif
+                                                font.pixelSize: 30
+                                                font.italic: true
+                                            }
+                                        }
+
+                                        // meter
+                                        Rectangle {
+                                            visible: { return isNaN(siSec.sec.m) === false; }
+                                            width: parent.width
+                                            height: 28
+                                            color: "white"
+                                            border.width: 2
+                                            border.color: siPanel.ink
+                                            Rectangle {
+                                                x: 4
+                                                y: 4
+                                                height: parent.height - 8
+                                                width: { return isNaN(siSec.sec.m) ? 0 : Math.max(0, (parent.width - 8) * siSec.sec.m); }
+                                                color: siPanel.ink
+                                            }
+                                        }
+
+                                        // per-core bars
+                                        Row {
+                                            visible: siSec.sec.bars.length > 0
+                                            width: parent.width
+                                            spacing: 18
+                                            Repeater {
+                                                model: siSec.sec.bars.length
+                                                delegate: Column {
+                                                    id: siBarCell
+                                                    required property int index
+                                                    readonly property var b: siSec.sec.bars[index] || ["", NaN]
+                                                    width: { return (siSec.width - 18 * (siSec.sec.bars.length - 1)) / Math.max(1, siSec.sec.bars.length); }
+                                                    spacing: 6
+                                                    Rectangle {
+                                                        width: parent.width
+                                                        height: 14
+                                                        border.width: 2
+                                                        border.color: siPanel.ink
+                                                        color: "white"
+                                                        Rectangle {
+                                                            height: parent.height
+                                                            width: { return isNaN(siBarCell.b[1]) ? 0 : parent.width * siBarCell.b[1]; }
+                                                            color: siPanel.ink
+                                                        }
+                                                    }
+                                                    Text {
+                                                        width: parent.width
+                                                        horizontalAlignment: Text.AlignHCenter
+                                                        text: siBarCell.b[0] + "  " + (isNaN(siBarCell.b[1]) ? "–" : Math.round(siBarCell.b[1] * 100) + "%")
+                                                        color: siPanel.ink
+                                                        font.family: siPanel.serif
+                                                        font.pixelSize: 22
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // ledger rows
+                                        Column {
+                                            width: parent.width
+                                            spacing: 0
+                                            Repeater {
+                                                model: siSec.sec.rows.length
+                                                delegate: Item {
+                                                    id: siRow
+                                                    required property int index
+                                                    readonly property var r: siSec.sec.rows[index] || ["", ""]
+                                                    width: siSec.width
+                                                    height: 54
+                                                    Text {
+                                                        anchors.left: parent.left
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        text: siRow.r[0]
+                                                        color: siPanel.ink
+                                                        font.family: siPanel.serif
+                                                        font.pixelSize: 29
+                                                    }
+                                                    Text {
+                                                        anchors.right: parent.right
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        width: parent.width * 0.62
+                                                        horizontalAlignment: Text.AlignRight
+                                                        elide: Text.ElideLeft
+                                                        text: siRow.r[1]
+                                                        color: siPanel.ink
+                                                        font.family: siPanel.serif
+                                                        font.pixelSize: 29
+                                                    }
+                                                    Rectangle {
+                                                        anchors.bottom: parent.bottom
+                                                        width: parent.width
+                                                        height: 1
+                                                        color: siPanel.ink
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        }
+
+                        // ---------- log section ----------
+                        Item {
+                            id: siLog
+                            x: 60
+                            y: Math.max(1300, siCols.y + siCols.height + 70)
+                            width: parent.width - 120
+                            height: 620
+
+                            Rectangle {
+                                width: parent.width
+                                height: 2
+                                color: siPanel.ink
+                            }
+
+                            Text {
+                                id: siLogTitle
+                                y: 40
+                                text: "LOGGING"
+                                color: siPanel.ink
+                                font.family: siPanel.serif
+                                font.pixelSize: 26
+                                font.weight: Font.DemiBold
+                                font.letterSpacing: 8
+                            }
+
+                            Row {
+                                id: siLogCtl
+                                anchors.right: parent.right
+                                y: 24
+                                spacing: 40
+
+                                Row {
+                                    spacing: 0
+                                    Repeater {
+                                        model: ["Off", "On"]
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            required property int index
+                                            readonly property bool on: { return (index === 1) === (siPanel.settings.logging === true); }
+                                            width: 110
+                                            height: 64
+                                            color: on ? siPanel.ink : "white"
+                                            border.width: 2
+                                            border.color: siPanel.ink
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: modelData
+                                                color: parent.on ? "white" : siPanel.ink
+                                                font.family: siPanel.serif
+                                                font.pixelSize: 30
+                                            }
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                onClicked: siPanel.setLogging(index === 1)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Row {
+                                    spacing: 0
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: "Every  "
+                                        color: siPanel.ink
+                                        font.family: siPanel.serif
+                                        font.pixelSize: 26
+                                        font.italic: true
+                                    }
+                                    Repeater {
+                                        model: [1, 5, 15]
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            readonly property bool on: siPanel.settings.logMinutes === modelData
+                                            width: 120
+                                            height: 64
+                                            color: on ? siPanel.ink : "white"
+                                            border.width: 2
+                                            border.color: siPanel.ink
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: modelData + " min"
+                                                color: parent.on ? "white" : siPanel.ink
+                                                font.family: siPanel.serif
+                                                font.pixelSize: 26
+                                            }
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                onClicked: {
+                                                    siPanel.touch();
+                                                    siPanel.setSetting("logMinutes", modelData);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 150
+                                    height: 64
+                                    color: siPanel.clearArmed ? siPanel.ink : "white"
+                                    border.width: 2
+                                    border.color: siPanel.ink
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: siPanel.clearArmed ? "Sure?" : "Clear"
+                                        color: siPanel.clearArmed ? "white" : siPanel.ink
+                                        font.family: siPanel.serif
+                                        font.pixelSize: 26
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: siPanel.clearLog()
+                                    }
+                                }
+                            }
+
+                            Text {
+                                id: siLogNote
+                                y: 112
+                                width: parent.width
+                                wrapMode: Text.WordWrap
+                                text: {
+                                    if (siPanel.logStatus.length > 0) return siPanel.logStatus + "   " + (siPanel.settings.logging ? "File: ~/.local/share/sysinfo/log.csv" : "");
+                                    if (siPanel.settings.logging) return "Logging every " + siPanel.settings.logMinutes + " min to ~/.local/share/sysinfo/log.csv  ·  " + siPanel.logRows.length + " rows";
+                                    return "Logging is off. Nothing runs while this panel is closed.  ·  " + siPanel.logRows.length + " rows saved";
+                                }
+                                color: siPanel.ink
+                                font.family: siPanel.serif
+                                font.pixelSize: 26
+                                font.italic: true
+                            }
+
+                            Canvas {
+                                id: siChart
+                                y: 170
+                                width: parent.width
+                                height: 440
+                                renderStrategy: Canvas.Immediate
+
+                                function series(col) {
+                                    const now = Date.now() / 1000;
+                                    const out = [];
+                                    siPanel.logRows.forEach(function (l) {
+                                        const f = l.split(",");
+                                        const t = parseFloat(f[0]);
+                                        const v = parseFloat(f[col]);
+                                        if (t > now - 86400 && isNaN(v) === false) out.push([t, v]);
+                                    });
+                                    return out;
+                                }
+
+                                function plot(ctx, pts, top, h, maxV, label, unit) {
+                                    const w = width;
+                                    const now = Date.now() / 1000;
+                                    const gap = Math.max(3, siPanel.settings.logMinutes) * 60 * 3;
+                                    ctx.fillStyle = "#000000";
+                                    ctx.font = "italic 24px '" + siPanel.serif + "'";
+                                    ctx.textAlign = "left";
+                                    ctx.fillText(label, 0, top + 22);
+                                    ctx.textAlign = "right";
+                                    ctx.fillText(pts.length > 0 ? "now " + Math.round(pts[pts.length - 1][1]) + unit : "no samples yet", w, top + 22);
+                                    const y0 = top + 36;
+                                    const ph = h - 100;
+                                    ctx.lineWidth = 1;
+                                    ctx.strokeStyle = "#000000";
+                                    ctx.beginPath();
+                                    ctx.moveTo(0, y0 + ph + 0.5);
+                                    ctx.lineTo(w, y0 + ph + 0.5);
+                                    ctx.stroke();
+                                    // 6 h ticks
+                                    ctx.textAlign = "center";
+                                    ctx.font = "20px '" + siPanel.serif + "'";
+                                    for (let k = 0; k <= 4; k++) {
+                                        const x = w * k / 4;
+                                        ctx.beginPath();
+                                        ctx.moveTo(x, y0 + ph);
+                                        ctx.lineTo(x, y0 + ph + 8);
+                                        ctx.stroke();
+                                        ctx.fillText(k === 4 ? "now" : "-" + (24 - k * 6) + " h", Math.min(w - 24, Math.max(24, x)), y0 + ph + 30);
+                                    }
+                                    ctx.lineWidth = 3;
+                                    ctx.beginPath();
+                                    let last = -1;
+                                    pts.forEach(function (p) {
+                                        const x = (p[0] - (now - 86400)) / 86400 * w;
+                                        const y = y0 + ph - Math.max(0, Math.min(1, p[1] / maxV)) * ph;
+                                        if (last < 0 || p[0] - last > gap) ctx.moveTo(x, y);
+                                        else ctx.lineTo(x, y);
+                                        last = p[0];
+                                    });
+                                    ctx.stroke();
+                                }
+
+                                onPaint: {
+                                    const ctx = getContext("2d");
+                                    ctx.fillStyle = "#ffffff";
+                                    ctx.fillRect(0, 0, width, height);
+                                    plot(ctx, series(2), 0, 220, 100, "Battery, last 24 h", " %");
+                                    plot(ctx, series(8), 220, 220, 100, "Processor busy, last 24 h", " %");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        TRAVERSE [[14125623155555875541]]#[[15885405667098360701]]
+            LOCATE BEFORE [[425121728314878811.452264033555071090]]#[[7709552972437696890]]
+            INSERT {
+                ArkControls.SidebarItem {
+                    id: siSidebarItem
+                    objectName: "siSidebarItem"
+                    text: "System"
+                    description: siPanel.settings.logging ? "Logging on" : ""
+                    iconSource: "qrc:/ark/icons/information_circle"
+                    highlighted: false
+                    onClicked: {
+                        root.toggle();
+                        siPanel.open();
+                    }
+                    Layout.preferredHeight: Common.Values.navigatorSidebarItemHeight
+                    Layout.preferredWidth: parent.width
+                }
+            }
+        END TRAVERSE
+    END TRAVERSE
+END AFFECT

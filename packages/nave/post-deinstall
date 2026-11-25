@@ -1,0 +1,8 @@
+#!/bin/sh
+HS=/home/root/.local/share/homescreen
+if [ "$VELLUM_PURGE" = "1" ]; then
+	rm -f "$HS/plates/plates.json" "$HS/progress.json"
+	rmdir "$HS/plates" "$HS" 2>/dev/null
+fi
+@RESTART@
+exit 0

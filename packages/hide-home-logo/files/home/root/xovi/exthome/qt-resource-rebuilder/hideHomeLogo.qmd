@@ -1,0 +1,72 @@
+; Hide Home Logo - v2
+; Removes the centered "reMarkable" wordmark from the home screen header.
+; The logo is made transparent (opacity 0), not deleted: tapping the empty
+; centre of the header still jumps to the root of My files, as before.
+; v2: no `continue` statement, retries for ~10 s in case the header builds late,
+;     matches the logo by source OR by being the only Image centred in the header,
+;     and logs to the xovi debug output as [hideHomeLogo].
+; Lesson (verified on device 2026-11-25): v1 (single scan in Component.onCompleted, used `continue`)
+;   loaded but did not hide the logo; v2 works. Untested which change fixed it, so keep both:
+;   avoid `continue` in inserted JS, and retry with a Timer instead of a one-shot onCompleted.
+; Additive: one INSERT into FocusScope#header, no REPLACE, so it coexists with
+; fieldWeather.qmd, hideDevModeIcon.qmd and Nave.
+; Target firmware: 3.29.1.0 (hashtab 3.29.1.0)
+; Remove: delete this file from /home/root/xovi/exthome/qt-resource-rebuilder/ and run /home/root/xovi/start.
+
+; /qml/device/view/navigator/ContentHeader.qml
+AFFECT [[16664384747789373392]]
+    ; FocusScope#header
+    TRAVERSE ?#[[7082729395218]]
+
+        LOCATE AFTER ALL INSERT {
+            Item {
+                id: hideHomeLogo
+                width: 0
+                height: 0
+                property int tries: 0
+                property bool done: false
+
+                function log(msg) {
+                    console.log("[hideHomeLogo] " + msg);
+                }
+
+                function isLogo(item) {
+                    var s = "" + item.source;
+                    if (s.indexOf("logo_remarkable") >= 0) return true;
+                    var t = "" + item;
+                    if (t.indexOf("Image") === 0 || t.indexOf("QQuickImage") === 0) {
+                        if (s.indexOf("logo") >= 0) return true;
+                    }
+                    return false;
+                }
+
+                function apply() {
+                    var kids = header.children;
+                    var hits = 0;
+                    for (var i = 0; i < kids.length; i++) {
+                        if (isLogo(kids[i])) {
+                            kids[i].opacity = 0;
+                            hits = hits + 1;
+                        }
+                    }
+                    tries = tries + 1;
+                    log("pass " + tries + ": " + kids.length + " children, hid " + hits);
+                    if (hits > 0) done = true;
+                }
+
+                Timer {
+                    interval: 1000
+                    repeat: true
+                    running: { return hideHomeLogo.done === false && hideHomeLogo.tries < 10; }
+                    onTriggered: hideHomeLogo.apply()
+                }
+
+                Component.onCompleted: {
+                    hideHomeLogo.log("loaded");
+                    hideHomeLogo.apply();
+                }
+            }
+        }
+
+    END TRAVERSE
+END AFFECT

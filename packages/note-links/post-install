@@ -1,0 +1,6 @@
+#!/bin/sh
+D=/home/root/.local/share/notelinks
+chmod +x "$D/rebuild-index.sh"
+[ -f "$D/index.json" ] || echo '{"v":1,"docs":{}}' > "$D/index.json"
+@RESTART@
+exit 0

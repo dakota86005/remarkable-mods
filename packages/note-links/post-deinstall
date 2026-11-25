@@ -1,0 +1,6 @@
+#!/bin/sh
+# Links live in each notebook's notelinks.rm and are never removed here.
+# Purge only drops the index, which rebuild-index.sh can recreate.
+[ "$VELLUM_PURGE" = "1" ] && rm -f /home/root/.local/share/notelinks/index.json && rmdir /home/root/.local/share/notelinks 2>/dev/null
+@RESTART@
+exit 0

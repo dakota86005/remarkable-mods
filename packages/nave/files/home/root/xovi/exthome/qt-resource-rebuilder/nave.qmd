@@ -1,0 +1,808 @@
+; Nave home screen - v3.1 (polish pass: NAVE-SPEC-v2)
+; Two-column home screen for My files (root folder, portrait, grid view):
+;   - Side aisle: weekday + date, MY FILES folder list with counts, a plate
+;     (random image from a folder on the tablet, 420 x 720) with a caption.
+;   - Main column: CONTINUE row (three most recently opened documents), then
+;     ALL DOCUMENTS with the stock sort control and the stock document grid,
+;     forced to 3 columns of 286 px with black tile frames.
+;   - The grid stops at a footer line (y 1870) so the stock search/+ pill sits on clean paper.
+;   - Per-document progress bar under grid covers and in Continue.
+;     Toggle it for selected documents from the selection bar's "More" menu.
+; Anywhere else (subfolders, Favorites, Tags, Trash, list view, landscape) the
+; home screen stays stock.
+;
+; Files on the tablet:
+;   /home/root/.local/share/homescreen/plates/plates.json   (plate manifest)
+;   /home/root/.local/share/homescreen/plates/*.png          (420 x 720, white bg)
+;   /home/root/.local/share/homescreen/progress.json         (per-document bar choices)
+;
+; Replaces homeCards.qmd: remove homeCards.qmd before installing this.
+; Coexists with fieldWeather.qmd and hideDevModeIcon.qmd (ContentHeader is untouched).
+; qmldiff note: a binding value (outside a { } block) must not contain "!" (also
+; "!=", "!==") or start with "("; such values are { return ...; } blocks.
+; Checked with tools/qmd_lint.py.
+; Target firmware: 3.29.1.0 (hashtab 3.29.1.0)
+; Remove: delete this file from /home/root/xovi/exthome/qt-resource-rebuilder/ and run /home/root/xovi/start.
+;
+; Coordinates below are local to TreeExplorerView, which starts 120 px below the
+; top of the screen (screen y = local y + 120).
+
+; ===========================================================================
+; Layout, aisle, plate, Continue row
+; /qml/device/view/syncserviceexplorer/TreeExplorerView.qml
+AFFECT [[3910876122537076124]]
+
+    ; Item#root
+    TRAVERSE ?#[[6504254477]]
+        LOCATE AFTER ALL INSERT {
+            property var naveRef: naveLayout
+
+            Item {
+                id: naveLayout
+                anchors.fill: parent
+                z: 50
+                visible: naveLayout.active
+
+                // ---------------------------------------------------- state
+                readonly property bool active: {
+                    if (root.width < 1400) return false;
+                    if (root.height < root.width) return false;
+                    if (typeof ViewManager === "undefined") return false;
+                    if (ViewManager.activeView !== ViewManager.View.MyFiles) return false;
+                    if (thumbnailSettings.thumbnailSize === ThumbnailSettings.List) return false;
+                    if (root.explorer === null || root.explorer === undefined) return false;
+                    return explorerView.currentFolder === root.explorer.rootId();
+                }
+
+                readonly property string serif: "EB Garamond"
+                readonly property color ink: "#000000"
+                // ALL DOCUMENTS line: stock header (120 tall) top edge; grid starts 120 below
+                readonly property int headerY: 274
+                // grid viewport ends here (screen y 1870)
+                readonly property int footerY: 1750
+                readonly property int mainX: 590
+                readonly property int mainW: 970
+                readonly property int colW: 286
+                readonly property int colGap: 56
+                readonly property string dataDir: "file:///home/root/.local/share/homescreen/"
+
+                // ------------------------------------------- progress prefs
+                property var prefs: {
+                    return {};
+                }
+                property int prefsVersion: 0
+                property var defaults: {
+                    return {};
+                }
+
+                function defaultBar(ci, cc, ft) {
+                    if (!cc || cc < 2) return false;
+                    if (ft === Entity.FileType.Epub) return ci < cc - 1;
+                    return ci + 1 < cc;
+                }
+
+                function barVisible(id, ci, cc, ft) {
+                    var v = naveLayout.prefsVersion;
+                    var d = naveLayout.defaultBar(ci, cc, ft);
+                    if (id) naveLayout.defaults[id] = d;
+                    if (id && naveLayout.prefs.hasOwnProperty(id)) return naveLayout.prefs[id] === true;
+                    return d;
+                }
+
+                function progressOf(ci, cc, ft) {
+                    if (!cc) return 0;
+                    if (ft === Entity.FileType.Epub) return cc < 2 ? 0 : Math.min(1, ci / (cc - 1));
+                    return Math.min(1, (ci + 1) / cc);
+                }
+
+                function pageText(ci, cc, ft, locked) {
+                    if (locked) return "Password protected";
+                    if (ft === Entity.FileType.Epub) return Math.round(naveLayout.progressOf(ci, cc, ft) * 100) + "% read";
+                    if (cc > 0) return "Page " + (ci + 1) + " of " + cc;
+                    return "";
+                }
+
+                // true when every id currently shows a bar
+                function allShown(ids) {
+                    if (!ids || ids.length === 0) return false;
+                    for (var i = 0; i < ids.length; i++) {
+                        var id = "" + ids[i];
+                        var shown = naveLayout.prefs.hasOwnProperty(id) ? naveLayout.prefs[id] === true : naveLayout.defaults[id] === true;
+                        if (shown === false) return false;
+                    }
+                    return true;
+                }
+
+                function setBars(ids, show) {
+                    var p = naveLayout.prefs;
+                    for (var i = 0; i < ids.length; i++) p["" + ids[i]] = show;
+                    naveLayout.prefs = p;
+                    naveLayout.prefsVersion = naveLayout.prefsVersion + 1;
+                    var req = new XMLHttpRequest();
+                    req.open("PUT", naveLayout.dataDir + "progress.json");
+                    req.send(JSON.stringify(p));
+                }
+
+                function toggleBars(ids) {
+                    naveLayout.setBars(ids, naveLayout.allShown(ids) ? false : true);
+                }
+
+                function loadPrefs() {
+                    var req = new XMLHttpRequest();
+                    req.open("GET", naveLayout.dataDir + "progress.json");
+                    req.onreadystatechange = function() {
+                        if (req.readyState !== XMLHttpRequest.DONE) return;
+                        try {
+                            if (req.responseText) {
+                                naveLayout.prefs = JSON.parse(req.responseText) || {};
+                                naveLayout.prefsVersion = naveLayout.prefsVersion + 1;
+                            }
+                        } catch (e) {}
+                    };
+                    req.send();
+                }
+
+                // ------------------------------------------------- plates
+                property var plates: []
+                property int plateIndex: -1
+                readonly property string plateFile: {
+                    if (naveLayout.plateIndex < 0 || naveLayout.plateIndex >= naveLayout.plates.length) return "";
+                    return naveLayout.plates[naveLayout.plateIndex].file || "";
+                }
+                readonly property string plateCaption: {
+                    if (naveLayout.plateIndex < 0 || naveLayout.plateIndex >= naveLayout.plates.length) return "";
+                    return naveLayout.plates[naveLayout.plateIndex].caption || "";
+                }
+
+                function pickPlate() {
+                    var n = naveLayout.plates.length;
+                    if (n === 0) { naveLayout.plateIndex = -1; return; }
+                    if (n === 1) { naveLayout.plateIndex = 0; return; }
+                    var k = Math.floor(Math.random() * (n - 1));
+                    if (k >= naveLayout.plateIndex && naveLayout.plateIndex >= 0) k = k + 1;
+                    naveLayout.plateIndex = k;
+                }
+
+                function loadPlates() {
+                    var req = new XMLHttpRequest();
+                    req.open("GET", naveLayout.dataDir + "plates/plates.json");
+                    req.onreadystatechange = function() {
+                        if (req.readyState !== XMLHttpRequest.DONE) return;
+                        try {
+                            var j = JSON.parse(req.responseText);
+                            naveLayout.plates = (j && j.plates) ? j.plates : [];
+                        } catch (e) {
+                            naveLayout.plates = [];
+                        }
+                        naveLayout.pickPlate();
+                    };
+                    req.send();
+                }
+
+                // ---------------------------------------------------- date
+                property string weekday: ""
+                property string dateLine: ""
+                function updateDate() {
+                    var d = new Date();
+                    var w = Qt.formatDate(d, "dddd").toUpperCase();
+                    var l = Qt.formatDate(d, "MMMM d");
+                    if (w !== naveLayout.weekday) naveLayout.weekday = w;
+                    if (l !== naveLayout.dateLine) naveLayout.dateLine = l;
+                }
+
+                Timer {
+                    interval: 60000
+                    running: true
+                    repeat: true
+                    onTriggered: naveLayout.updateDate()
+                }
+
+                Connections {
+                    target: {
+                        if (typeof BatteryManager === "undefined") return null;
+                        return BatteryManager;
+                    }
+                    ignoreUnknownSignals: true
+                    function onDisplayStateChanged(previous, next) {
+                        var wasAsleep = previous === BatteryManager.DeepSleep || previous === BatteryManager.LightSleep;
+                        if (wasAsleep && next === BatteryManager.Normal) {
+                            naveLayout.updateDate();
+                            naveLayout.loadPlates();
+                        }
+                    }
+                }
+
+                // Moves the stock "My files" header onto the ALL DOCUMENTS line and
+                // fits the stock grid into the main column, ending at the footer line.
+                // The grid is 3 x (286 + 56) = 1026 wide so that exactly 3 cells fit;
+                // the last 56 px are the trailing gap. All bindings return the stock
+                // values when Nave is not active.
+                Component.onCompleted: {
+                    var vhm = Values.viewHorizontalMargin;
+                    var gm = Values.designGridMargin;
+                    explorerHeader.anchors.topMargin = Qt.binding(function() { return naveLayout.active ? naveLayout.headerY : 0; });
+                    explorerHeader.anchors.leftMargin = Qt.binding(function() { return naveLayout.active ? naveLayout.mainX - 10 : vhm; });
+                    explorerHeader.anchors.rightMargin = Qt.binding(function() { return naveLayout.active ? 45 : -gm; });
+                    var content = explorerView.parent;
+                    if (content) {
+                        content.anchors.leftMargin = Qt.binding(function() { return naveLayout.active ? naveLayout.mainX - vhm : 0; });
+                        content.anchors.rightMargin = Qt.binding(function() {
+                            return naveLayout.active ? root.width - naveLayout.mainX - 3 * (naveLayout.colW + naveLayout.colGap) - vhm : 0;
+                        });
+                        content.anchors.bottomMargin = Qt.binding(function() { return naveLayout.active ? Math.max(0, root.height - naveLayout.footerY) : 0; });
+                    }
+                    naveLayout.updateDate();
+                    naveLayout.loadPrefs();
+                    naveLayout.loadPlates();
+                }
+
+                // ------------------------------------------------- models
+                EntitySortedListModel {
+                    id: naveFolders
+                    typeFilter: EntitySortedListModel.Filter.Folder
+                    sortType: EntitySortedListModel.SortType.Alphabetically
+                    currentSortOrder: Qt.DescendingOrder
+                    model: root.currentModel
+                }
+
+                EntitySortedListModel {
+                    id: naveRecent
+                    typeFilter: EntitySortedListModel.Filter.AllNonFolders
+                    sortType: EntitySortedListModel.SortType.LastOpened
+                    currentSortOrder: Qt.DescendingOrder
+                    model: root.currentModel
+                }
+
+                // Folder glyph, used through Loaders
+                Component {
+                    id: naveFolderGlyph
+                    Canvas {
+                        width: 34
+                        height: 28
+                        onPaint: {
+                            var c = getContext("2d");
+                            c.reset();
+                            c.lineWidth = 2.5;
+                            c.lineJoin = "round";
+                            c.strokeStyle = "#000000";
+                            c.beginPath();
+                            c.moveTo(2, 4);
+                            c.lineTo(12, 4);
+                            c.lineTo(15, 8);
+                            c.lineTo(32, 8);
+                            c.lineTo(32, 26);
+                            c.lineTo(2, 26);
+                            c.closePath();
+                            c.stroke();
+                        }
+                    }
+                }
+
+                // ================================================== AISLE
+                Rectangle {
+                    id: naveAisle
+                    x: 0
+                    y: 0
+                    width: 560
+                    height: naveLayout.footerY
+                    color: "white"
+
+                    // swallow taps on empty aisle space
+                    MouseArea { anchors.fill: parent }
+
+                    Text {
+                        id: naveWeekday
+                        x: 60
+                        y: 56
+                        text: naveLayout.weekday
+                        color: naveLayout.ink
+                        font.family: naveLayout.serif
+                        font.pixelSize: 26
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 8
+                    }
+
+                    Text {
+                        id: naveDate
+                        x: 56
+                        y: 94
+                        width: 440
+                        text: naveLayout.dateLine
+                        color: naveLayout.ink
+                        font.family: naveLayout.serif
+                        font.pixelSize: 76
+                        fontSizeMode: Text.HorizontalFit
+                        minimumPixelSize: 48
+                    }
+
+                    Rectangle {
+                        x: 60
+                        y: 217
+                        width: 420
+                        height: 2
+                        color: naveLayout.ink
+                    }
+
+                    Text {
+                        x: 60
+                        y: 254
+                        text: "MY FILES"
+                        color: naveLayout.ink
+                        font.family: naveLayout.serif
+                        font.pixelSize: 26
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 8
+                    }
+
+                    Rectangle {
+                        x: 60
+                        y: 308
+                        width: 420
+                        height: 2
+                        color: naveLayout.ink
+                    }
+
+                    Flickable {
+                        id: naveFolderList
+                        x: 60
+                        y: 310
+                        width: 420
+                        height: {
+                            var room = naveLayout.footerY - 310 - 20;
+                            return Math.min(naveFolderColumn.height, room);
+                        }
+                        contentHeight: naveFolderColumn.height
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        interactive: contentHeight > height
+
+                        Column {
+                            id: naveFolderColumn
+                            width: parent.width
+
+                            Repeater {
+                                model: naveFolders
+                                delegate: Item {
+                                    width: 420
+                                    height: 96
+
+                                    Loader {
+                                        x: 6
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 34
+                                        height: 28
+                                        sourceComponent: naveFolderGlyph
+                                    }
+
+                                    Text {
+                                        x: 56
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 300
+                                        text: model.name || ""
+                                        elide: Text.ElideRight
+                                        textFormat: Text.PlainText
+                                        color: naveLayout.ink
+                                        font.family: naveLayout.serif
+                                        font.pixelSize: 38
+                                        font.weight: Font.DemiBold
+                                    }
+
+                                    Text {
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: 6
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: model.childCount > 0
+                                        text: model.childCount
+                                        color: naveLayout.ink
+                                        font.family: naveLayout.serif
+                                        font.pixelSize: 32
+                                    }
+
+                                    Rectangle {
+                                        anchors.bottom: parent.bottom
+                                        width: parent.width
+                                        height: 2
+                                        color: naveLayout.ink
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: explorerView.openId(model.id, model.type)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Plate: 420 x 720 slot whose bottom edge is at local 1666
+                    // (screen 1786). Shrinks to fit (bottom-anchored) when the folder
+                    // list leaves less room; hidden below 360 px.
+                    Item {
+                        id: navePlate
+                        readonly property int bottomY: 1666
+                        readonly property int room: {
+                            var top = naveFolderList.y + naveFolderList.height + 30;
+                            return Math.min(720, navePlate.bottomY - top);
+                        }
+                        x: 60
+                        y: navePlate.bottomY - navePlate.room
+                        width: 420
+                        height: navePlate.room
+                        visible: {
+                            if (naveLayout.plateFile === "") return false;
+                            if (root.height < naveLayout.footerY) return false;
+                            return navePlate.room >= 360;
+                        }
+
+                        Image {
+                            anchors.fill: parent
+                            fillMode: Image.PreserveAspectFit
+                            verticalAlignment: Image.AlignBottom
+                            horizontalAlignment: Image.AlignHCenter
+                            asynchronous: true
+                            cache: false
+                            source: {
+                                if (naveLayout.plateFile === "") return "";
+                                return naveLayout.dataDir + "plates/" + naveLayout.plateFile;
+                            }
+                        }
+                    }
+
+                    Text {
+                        x: 60
+                        y: 1684
+                        width: 420
+                        visible: navePlate.visible
+                        horizontalAlignment: Text.AlignHCenter
+                        text: naveLayout.plateCaption.toUpperCase()
+                        color: naveLayout.ink
+                        font.family: naveLayout.serif
+                        font.pixelSize: 26
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 8
+                        elide: Text.ElideRight
+                    }
+                }
+
+                // vertical hairline between aisle and main column (screen y 174 to 1870)
+                Rectangle {
+                    x: 530
+                    y: 54
+                    width: 2
+                    height: naveLayout.footerY - 54
+                    color: naveLayout.ink
+                }
+
+                // footer hairline (screen y 1870), x 60 to 1560
+                Rectangle {
+                    x: 60
+                    y: naveLayout.footerY
+                    width: 1500
+                    height: 2
+                    color: naveLayout.ink
+                }
+
+                // ============================================= CONTINUE
+                Rectangle {
+                    id: naveHero
+                    x: 560
+                    y: 0
+                    width: parent.width - 560
+                    height: naveLayout.headerY
+                    color: "white"
+
+                    Text {
+                        x: 30
+                        y: 56
+                        text: "CONTINUE"
+                        color: naveLayout.ink
+                        font.family: naveLayout.serif
+                        font.pixelSize: 26
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 8
+                    }
+
+                    Text {
+                        x: 30
+                        y: 110
+                        visible: naveHeroRepeater.count === 0
+                        text: "Nothing opened yet"
+                        color: naveLayout.ink
+                        font.family: naveLayout.serif
+                        font.italic: true
+                        font.pixelSize: 31
+                    }
+
+                    Repeater {
+                        id: naveHeroRepeater
+                        model: naveRecent
+
+                        // One row of three, same columns as the grid (screen y 232)
+                        delegate: Item {
+                            id: naveRecentItem
+                            visible: index < 3
+                            x: 30 + index * (naveLayout.colW + naveLayout.colGap)
+                            y: 112
+                            width: naveLayout.colW
+                            height: 144
+                            readonly property bool locked: model.isPasswordProtected === true
+                            readonly property bool bar: naveLayout.barVisible("" + model.id, model.childIndex, model.childCount, model.filetype)
+                            readonly property real frac: naveLayout.progressOf(model.childIndex, model.childCount, model.filetype)
+
+                            Rectangle {
+                                id: naveRecentCover
+                                x: 0
+                                y: 0
+                                width: 108
+                                height: 144
+                                color: "white"
+                                border.width: 2.5
+                                border.color: naveLayout.ink
+                                Image {
+                                    anchors.fill: parent
+                                    anchors.margins: 2.5
+                                    fillMode: Image.PreserveAspectCrop
+                                    asynchronous: true
+                                    mipmap: true
+                                    source: {
+                                        if (index >= 3 || naveRecentItem.locked || !model.thumbnail) return "";
+                                        return model.thumbnail;
+                                    }
+                                }
+                            }
+
+                            Text {
+                                x: 126
+                                y: 0
+                                width: naveLayout.colW - 126
+                                text: model.name || ""
+                                textFormat: Text.PlainText
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                                color: naveLayout.ink
+                                font.family: naveLayout.serif
+                                font.pixelSize: 31
+                                font.weight: Font.DemiBold
+                            }
+
+                            Text {
+                                x: 126
+                                y: 44
+                                width: naveLayout.colW - 126
+                                text: naveLayout.pageText(model.childIndex, model.childCount, model.filetype, naveRecentItem.locked)
+                                elide: Text.ElideRight
+                                color: naveLayout.ink
+                                font.family: naveLayout.serif
+                                font.italic: true
+                                font.pixelSize: 25
+                            }
+
+                            Item {
+                                x: 126
+                                y: 144 - 9
+                                width: naveLayout.colW - 126
+                                height: 9
+                                visible: naveRecentItem.bar
+
+                                Rectangle {
+                                    y: 7
+                                    width: parent.width
+                                    height: 2
+                                    color: naveLayout.ink
+                                }
+                                Rectangle {
+                                    width: Math.round(parent.width * naveRecentItem.frac)
+                                    height: 7
+                                    color: naveLayout.ink
+                                }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: explorerView.openId(model.id, model.type)
+                            }
+                        }
+                    }
+
+                    // hairline under the row (screen y 416)
+                    Rectangle {
+                        x: 30
+                        y: 296
+                        width: naveLayout.mainW
+                        height: 2
+                        color: naveLayout.ink
+                    }
+                }
+
+                // ALL DOCUMENTS label over the stock breadcrumb ("My files"),
+                // leaving the stock sort control on the right uncovered
+                Rectangle {
+                    x: naveLayout.mainX - 20
+                    y: 300
+                    width: 560
+                    height: naveLayout.headerY + Values.navigationEntriesHeaderHeight - 300
+                    color: "white"
+
+                    Text {
+                        x: 20
+                        y: 28
+                        text: "ALL DOCUMENTS"
+                        color: naveLayout.ink
+                        font.family: naveLayout.serif
+                        font.pixelSize: 26
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 8
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+
+END AFFECT
+
+; ===========================================================================
+; Grid: folder row collapsed (folders are in the aisle) and cells forced to
+; 3 columns of 286 + 56 while Nave is active.
+; /qml/device/view/syncserviceexplorer/ContentGridView.qml
+AFFECT [[13817727852014686524]]
+
+    ; GridView#gridView > GridView#folderGrid
+    TRAVERSE [[7711703004395498]]#[[7713066794570762]] > [[7711703004395498]]#[[8399479237029256267]]
+        LOCATE AFTER ALL INSERT {
+            Component.onCompleted: {
+                var stockW = gridView.cellWidth;
+                folderGrid.height = Qt.binding(function() {
+                    if (typeof naveLayout !== "undefined" && naveLayout.active) return 0;
+                    return folderGrid.contentHeight;
+                });
+                gridView.cellWidth = Qt.binding(function() {
+                    if (typeof naveLayout !== "undefined" && naveLayout.active) return naveLayout.colW + naveLayout.colGap;
+                    return thumbnailGridSize.gridItemWidth;
+                });
+                gridView.cellHeight = Qt.binding(function() {
+                    if (typeof naveLayout !== "undefined" && naveLayout.active) return 381 + 120 + 46;
+                    return thumbnailGridSize.gridItemHeight;
+                });
+            }
+        }
+    END TRAVERSE
+
+END AFFECT
+
+; ===========================================================================
+; Document tiles (Nave only): black 2.5 px frame instead of the stock cover frame,
+; cover 286 x 381, progress bar, serif title 33 px, italic page line 27 px.
+; /qml/device/view/syncserviceexplorer/ContentGridItem.qml
+AFFECT [[13817727312169216272]]
+
+    ; ContentItemBase#gridItem
+    TRAVERSE ?#[[7713066794115550]]
+        LOCATE AFTER ALL INSERT {
+            Item {
+                id: naveTile
+                readonly property bool naveOn: {
+                    if (typeof naveLayout === "undefined") return false;
+                    return naveLayout.active;
+                }
+
+                // Set at runtime so the stock values come back whenever Nave is
+                // off (delegates are pooled and reused).
+                Component.onCompleted: {
+                    var tf = _title.font.family;
+                    var ts = _title.font.pixelSize;
+                    var tw = _title.font.weight;
+                    var sf = _infoText.font.family;
+                    var ss = _infoText.font.pixelSize;
+                    var cm = gridItem.cellMargin;
+                    var tbm = _thumbnail.anchors.bottomMargin;
+                    var cbm = textColumn.anchors.bottomMargin;
+                    _title.font.family = Qt.binding(function() { return naveTile.naveOn ? "EB Garamond" : tf; });
+                    _title.font.pixelSize = Qt.binding(function() { return naveTile.naveOn ? 33 : ts; });
+                    _title.font.weight = Qt.binding(function() { return naveTile.naveOn ? Font.DemiBold : tw; });
+                    _title.color = Qt.binding(function() { return naveTile.naveOn ? (gridItem.selected ? "#ffffff" : "#000000") : gridItem.itemColor; });
+                    _infoText.font.family = Qt.binding(function() { return naveTile.naveOn ? "EB Garamond" : sf; });
+                    _infoText.font.pixelSize = Qt.binding(function() { return naveTile.naveOn ? 27 : ss; });
+                    _infoText.font.italic = Qt.binding(function() { return naveTile.naveOn; });
+                    // cover fills the left 286 px of the 342 px cell, 46 px row gap at the bottom
+                    _thumbnail.anchors.leftMargin = Qt.binding(function() { return naveTile.naveOn ? 0 : cm; });
+                    _thumbnail.anchors.topMargin = Qt.binding(function() { return naveTile.naveOn ? 0 : cm; });
+                    _thumbnail.anchors.rightMargin = Qt.binding(function() { return naveTile.naveOn ? naveLayout.colGap : cm; });
+                    _thumbnail.anchors.bottomMargin = Qt.binding(function() { return naveTile.naveOn ? 22 : tbm; });
+                    textColumn.anchors.leftMargin = Qt.binding(function() { return naveTile.naveOn ? 0 : cm; });
+                    textColumn.anchors.rightMargin = Qt.binding(function() { return naveTile.naveOn ? naveLayout.colGap : cm; });
+                    textColumn.anchors.bottomMargin = Qt.binding(function() { return naveTile.naveOn ? 46 : cbm; });
+                    border.visible = Qt.binding(function() { return naveTile.naveOn ? false : true; });
+                    // PreserveAspectCrop paints past the item unless clipped; wide
+                    // covers (e.g. PDFs) spilled out of the narrower Nave cell.
+                    _image.clip = Qt.binding(function() { return naveTile.naveOn; });
+                }
+            }
+
+            // black frame over the cover
+            Rectangle {
+                id: naveTileFrame
+                parent: _thumbnail
+                anchors.fill: parent
+                visible: naveTile.naveOn
+                color: "transparent"
+                radius: 5
+                border.width: 2.5
+                border.color: gridItem.selected ? "#ffffff" : "#000000"
+            }
+
+            Item {
+                id: naveTileBar
+                anchors.top: _thumbnail.bottom
+                anchors.topMargin: 6
+                anchors.left: _thumbnail.left
+                anchors.right: _thumbnail.right
+                height: 7
+                visible: {
+                    if (naveTile.naveOn === false) return false;
+                    if (gridItem.type !== Entity.Type.File) return false;
+                    return naveLayout.barVisible(gridItem.entityId, gridItem.childIndex, gridItem.childCount, gridItem.filetype);
+                }
+
+                Rectangle {
+                    y: 5
+                    width: parent.width
+                    height: 2
+                    color: gridItem.itemColor
+                }
+                Rectangle {
+                    height: 7
+                    color: gridItem.itemColor
+                    width: {
+                        if (naveTileBar.visible === false) return 0;
+                        return Math.round(parent.width * naveLayout.progressOf(gridItem.childIndex, gridItem.childCount, gridItem.filetype));
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+
+END AFFECT
+
+; ===========================================================================
+; Selection "More" menu: Progress bar on/off for the selected documents
+; /qml/device/view/navigator/MyFilesMoreFoldout.qml
+AFFECT [[2260724785287532277]]
+
+    ; FoldoutOverlay#root > ColumnLayout (contentItem)
+    TRAVERSE [[15740235823693067624]]#[[6504254477]] > [[14125623155555875541]]
+        LOCATE AFTER ALL INSERT {
+            ArkControls.FoldoutItem {
+                id: naveProgressFoldoutItem
+                Layout.fillWidth: true
+                readonly property var naveRef: {
+                    if (typeof treeExplorerComponent === "undefined") return null;
+                    if (typeof treeExplorerComponent.naveRef === "undefined") return null;
+                    return treeExplorerComponent.naveRef;
+                }
+                readonly property var ids: {
+                    if (typeof actionHeader === "undefined") return [];
+                    return actionHeader.selection.selectedIds;
+                }
+                readonly property bool shown: {
+                    if (naveProgressFoldoutItem.naveRef === null) return false;
+                    var v = naveProgressFoldoutItem.naveRef.prefsVersion;
+                    return naveProgressFoldoutItem.naveRef.allShown(naveProgressFoldoutItem.ids);
+                }
+                visible: {
+                    if (naveProgressFoldoutItem.naveRef === null) return false;
+                    if (typeof actionHeader === "undefined") return false;
+                    if (actionHeader.selection.hasFolder) return false;
+                    return actionHeader.selection.hasPage ? false : true;
+                }
+                label: "Progress bar"
+                iconSource: naveProgressFoldoutItem.shown ? "qrc:/ark/icons/checkbox_checked" : "qrc:/ark/icons/checkbox_unchecked"
+                onClicked: {
+                    if (naveProgressFoldoutItem.naveRef === null) return;
+                    naveProgressFoldoutItem.naveRef.toggleBars(naveProgressFoldoutItem.ids);
+                    root.foldoutOverlayClicked();
+                }
+            }
+        }
+    END TRAVERSE
+
+END AFFECT

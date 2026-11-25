@@ -1,0 +1,4 @@
+#!/bin/sh
+[ "$VELLUM_PURGE" = "1" ] && rm -f /home/root/.local/share/fieldweather.json
+@RESTART@
+exit 0

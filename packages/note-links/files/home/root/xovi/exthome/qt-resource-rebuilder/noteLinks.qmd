@@ -1,0 +1,2840 @@
+; noteLinks - v2
+; Obsidian-style links and region tags for notebooks.
+;   Lasso handwriting -> tap "Link" or "Tag" chip (beside the lasso menu, finger tap)
+;   Link: pick a notebook, then a page. A badge marks the spot; tap it to jump, "Back" pill returns.
+;   Tag: pick or type a tag (handwriting is recognized and suggested when signed in).
+;        Adds a normal page tag, plus a marker on the exact spot.
+;   Toolbar link button: Links panel (from this page / linked from / tags index).
+;   Long-press a badge or marker to remove it.
+;   Home menu (hamburger) > "Links graph": every linked notebook and tag as a graph.
+; Data: <doc>/notelinks.rm (JSON in a .rm wrapper, syncs with the notebook)
+;       /home/root/.local/share/notelinks/index.json (local index for backlinks and tags)
+; Target firmware: 3.29.1.0 (hashtab 3.29.1.0)
+; Coexists with betterToc (uses its _isExtensionButton toolbar convention).
+; Remove: delete noteLinks.qmd from /home/root/xovi/exthome/qt-resource-rebuilder/ and run /home/root/xovi/start.
+
+; ---------------------------------------------------------------------------
+; Silence the native "convert selection" handlers while noteLinks runs a
+; recognition job, so the recognized text is not pasted into the page.
+; ---------------------------------------------------------------------------
+AFFECT [[15977735761668523171]]
+    TRAVERSE [[6502786168]]#[[6504254477]]
+        LOCATE BEFORE ALL
+        INSERT {
+            property bool nlSilent: false
+
+            function nlStart(items) {
+                if (!Authentication.loggedIn) {
+                    return false;
+                }
+                root.nlSilent = true;
+                Recognizer.startSelectionToolJob(items, Settings.handwritingConversionLanguage);
+                return true;
+            }
+
+            function nlJobState() {
+                const job = Recognizer.selectionToolJob;
+                if (!job) {
+                    return "none";
+                }
+                if (job.status === RecognitionJob.Status.Done) {
+                    return "done";
+                }
+                if (job.status === RecognitionJob.Status.Error) {
+                    return "error";
+                }
+                return "busy";
+            }
+
+            function nlJobText() {
+                return Recognizer.selectionToolJob.formattedTextToClipboardText();
+            }
+        }
+        TRAVERSE [[3914154588109996071]]#[[742117811095419965]]
+            REPLACE [[12940955005542131354]] WITH {
+                onFinishedChanged: {
+                    if (root.nlSilent) {
+                        return;
+                    }
+                    if (!finished) {
+                        return;
+                    }
+                    Clipboard.text = recognitionJob.formattedTextToClipboardText();
+                    if (Clipboard.hasText) {
+                        conversionFinished();
+                    }
+                }
+            }
+            REPLACE [[13557874878952466453]] WITH {
+                onFailedChanged: {
+                    if (root.nlSilent) {
+                        return;
+                    }
+                    if (failed) {
+                        conversionFailed();
+                    }
+                }
+            }
+        END TRAVERSE
+    END TRAVERSE
+END AFFECT
+
+; ---------------------------------------------------------------------------
+; Toolbar: Links panel button (counted as an extension button like betterToc's)
+; ---------------------------------------------------------------------------
+AFFECT [[11313888899523275277]]
+    IMPORT [[6504469795.6504031891.7712892662059645]] 1.0
+    TRAVERSE [[8397993708429497603]]#[[6504254477]]
+        TRAVERSE [[6502786168]]#[[233745975898428]] > [[8398044571386570029]]
+            LOCATE BEFORE [[7712155293725601]][.[[8399878573055752961]]=[["3575461827597527778]]]
+            INSERT {
+                ToolbarTool {
+                    id: nlLinksButton
+                    toolbar: root
+                    type: ToolbarTool.Type.ToolbarButton
+
+                    property bool _isExtensionButton: true
+                    iconSource: "qrc:/ark/icons/link"
+                    enabled: true
+                    visible: {
+                        return Boolean(document) && root.expanded && root.showableToolsCount > 6;
+                    }
+                    shouldShow: {
+                        return Boolean(document) && root.showableToolsCount > 6;
+                    }
+                    onUpdateShown: {
+                        var adjust = 0;
+                        for (var i = 0; i < toolLayout.children.length; i++) {
+                            var child = toolLayout.children[i];
+                            if (child._isExtensionButton && child.shouldShow) adjust++;
+                        }
+                        toolbarProvider.updateToolbarTools(root.showableToolsCount - adjust);
+                    }
+                    onPressed: {
+                        root.closeFoldout();
+                        if (typeof documentView.nlTogglePanel === "function") {
+                            documentView.nlTogglePanel();
+                        }
+                    }
+                }
+            }
+        END TRAVERSE
+    END TRAVERSE
+END AFFECT
+
+; ---------------------------------------------------------------------------
+; Document view: data layer, lasso chips, badges, picker, tag dialog, panel
+; ---------------------------------------------------------------------------
+AFFECT [[1224665461898798997]]
+    TRAVERSE [[8397993708429497603]]
+        LOCATE AFTER ALL
+        INSERT {
+            // ================= noteLinks: state =================
+            readonly property string nlRoot: "file:///home/root/.local/share/remarkable/xochitl/"
+            readonly property string nlIndexUrl: "file:///home/root/.local/share/notelinks/index.json"
+            readonly property string nlRmHeader: "reMarkable .lines file, version=6          "
+            readonly property string nlDocId: document ? String(document.id) : ""
+            property var nlData: null
+            property var nlIndex: null
+            property int nlRev: 0
+            property var nlSelRect: null
+            property var nlCapture: null
+            property var nlPending: null
+            property var nlBack: null
+            property bool nlBackShown: false
+            property string nlToast: ""
+            property bool nlPanelOpen: false
+            property string nlPanelTab: "links"
+            property bool nlPickerOpen: false
+            property string nlPickerStage: "doc"
+            property string nlPickerDoc: ""
+            property string nlPickerDocName: ""
+            property var nlPickerPages: []
+            property string nlPickerNote: ""
+            property int nlPickerLast: -1
+            property var nlPickerEntry: null
+            property bool nlThumbsOff: false
+            property var nlPickerDocs: []
+            property bool nlTagOpen: false
+            property string nlTagSuggestion: ""
+            property bool nlTagTyped: false
+            property var nlTagChoices: []
+            property var nlMenuItem: null
+            property var nlHwcCb: null
+            property int nlHwcTicks: 0
+            property int nlPendingTicks: 0
+            property var nlLib: null
+            property string nlOpenTag: ""
+
+            onNlDocIdChanged: {
+                root.nlPanelOpen = false;
+                root.nlPickerOpen = false;
+                root.nlTagOpen = false;
+                root.nlMenuItem = null;
+                root.nlSelRect = null;
+                root.nlLoad();
+                if (root.nlPending && root.nlPending.docId === root.nlDocId) {
+                    root.nlPendingTicks = 0;
+                    nlPendingTimer.restart();
+                }
+            }
+
+            // ================= noteLinks: storage =================
+            function nlUtf8(s) {
+                const out = [];
+                for (let i = 0; i < s.length; i++) {
+                    let c = s.charCodeAt(i);
+                    if (c < 0x80) {
+                        out.push(c);
+                    } else if (c < 0x800) {
+                        out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+                    } else if (c >= 0xd800 && c <= 0xdbff) {
+                        c = 0x10000 + ((c & 0x3ff) << 10) + (s.charCodeAt(++i) & 0x3ff);
+                        out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                    } else {
+                        out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                    }
+                }
+                return out;
+            }
+
+            function nlRmBytes(payload) {
+                let utf = nlUtf8(payload);
+                // the reader looks for the first open brace, so the length byte must not be one
+                if ((utf.length & 0xff) === 0x7b) {
+                    payload += " ";
+                    utf = nlUtf8(payload);
+                }
+                const n = utf.length;
+                const bytes = new Uint8Array(51 + n);
+                for (let h = 0; h < 43; h++) bytes[h] = nlRmHeader.charCodeAt(h) & 0xff;
+                bytes[43] = n & 0xff;
+                bytes[44] = (n >>> 8) & 0xff;
+                bytes[45] = (n >>> 16) & 0xff;
+                bytes[46] = (n >>> 24) & 0xff;
+                for (let i = 0; i < n; i++) bytes[51 + i] = utf[i];
+                return bytes.buffer;
+            }
+
+            function nlGet(url, cb) {
+                try {
+                    const req = new XMLHttpRequest();
+                    req.open("GET", url);
+                    req.onreadystatechange = () => {
+                        if (req.readyState === XMLHttpRequest.DONE) {
+                            cb(req.responseText || "");
+                        }
+                    };
+                    req.send();
+                } catch (e) {
+                    cb("");
+                }
+            }
+
+            function nlPut(url, body) {
+                try {
+                    const req = new XMLHttpRequest();
+                    req.open("PUT", url);
+                    req.send(body);
+                } catch (e) {
+                    console.log("noteLinks: write failed " + url + " " + e);
+                }
+            }
+
+            function nlParseJson(text) {
+                const start = text.indexOf(String.fromCharCode(123));
+                if (start < 0) return null;
+                try {
+                    return JSON.parse(text.substring(start));
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            function nlEmpty() {
+                return { v: 1, links: [], tags: [] };
+            }
+
+            function nlLoadIndex(cb) {
+                if (root.nlIndex) {
+                    cb();
+                    return;
+                }
+                nlGet(nlIndexUrl, (text) => {
+                    const idx = nlParseJson(text);
+                    root.nlIndex = (idx && idx.docs) ? idx : { v: 1, docs: {} };
+                    cb();
+                });
+            }
+
+            function nlLoad() {
+                const docId = root.nlDocId;
+                root.nlData = null;
+                root.nlRev++;
+                if (docId === "") return;
+                nlLoadIndex(() => {
+                    nlGet(nlRoot + docId + "/notelinks.rm", (text) => {
+                        if (docId !== root.nlDocId) return;
+                        let d = nlParseJson(text);
+                        if (!d || !Array.isArray(d.links)) {
+                            const cached = root.nlIndex.docs[docId];
+                            d = cached ? { v: 1, links: cached.links || [], tags: cached.tags || [] } : nlEmpty();
+                        }
+                        if (!Array.isArray(d.tags)) d.tags = [];
+                        root.nlData = d;
+                        root.nlRev++;
+                        nlSyncIndex(false);
+                    });
+                });
+            }
+
+            function nlPageNo(pageId) {
+                try {
+                    const p = document.pageForId(pageId);
+                    return (typeof p === "number" && p >= 0) ? p + 1 : 0;
+                } catch (e) {
+                    return 0;
+                }
+            }
+
+            function nlSyncIndex(force) {
+                if (!root.nlIndex || !root.nlData || root.nlDocId === "") return;
+                const d = root.nlData;
+                for (const l of d.links) l.pageNo = nlPageNo(l.pageId) || l.pageNo || 0;
+                for (const t of d.tags) t.pageNo = nlPageNo(t.pageId) || t.pageNo || 0;
+                const entry = {
+                    name: document ? document.visibleName : "",
+                    links: d.links,
+                    tags: d.tags
+                };
+                const before = JSON.stringify(root.nlIndex.docs[root.nlDocId] || null);
+                const empty = d.links.length === 0 && d.tags.length === 0;
+                if (empty) {
+                    delete root.nlIndex.docs[root.nlDocId];
+                } else {
+                    root.nlIndex.docs[root.nlDocId] = entry;
+                }
+                const after = JSON.stringify(root.nlIndex.docs[root.nlDocId] || null);
+                if (force || before !== after) {
+                    nlPut(nlIndexUrl, JSON.stringify(root.nlIndex));
+                }
+            }
+
+            function nlSave() {
+                if (!root.nlData || root.nlDocId === "") return;
+                nlPut(nlRoot + root.nlDocId + "/notelinks.rm", nlRmBytes(JSON.stringify(root.nlData)));
+                nlSyncIndex(true);
+                root.nlRev++;
+            }
+
+            function nlNewId() {
+                return Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
+            }
+
+            function nlShowToast(msg) {
+                root.nlToast = msg;
+                nlToastTimer.restart();
+            }
+
+            function nlDocName(docId, fallback) {
+                const e = Library.entryForId(docId);
+                return e ? e.visibleName : (fallback || "Missing notebook");
+            }
+
+            // ================= noteLinks: geometry =================
+            function nlToView(r) {
+                const tm = sceneView.tileManager;
+                if (!r || !tm) return Qt.rect(-1000, -1000, 0, 0);
+                return tm.sceneToView(Qt.rect(r[0], r[1], r[2], r[3]));
+            }
+
+            property var nlPageItems: {
+                root.nlRev;
+                const pid = root.currentPageId;
+                const out = [];
+                if (!root.nlData || !pid) return out;
+                for (const l of root.nlData.links) if (l.pageId === pid) out.push({ kind: "link", item: l });
+                for (const t of root.nlData.tags) if (t.pageId === pid) out.push({ kind: "tag", item: t });
+                return out;
+            }
+
+            // ================= noteLinks: lasso capture =================
+            Connections {
+                target: sceneView.controller
+                ignoreUnknownSignals: true
+                function onAreaSelected(layer, sceneRect) {
+                    if (sceneRect.width > 0 && sceneRect.height > 0) {
+                        root.nlSelRect = [sceneRect.x, sceneRect.y, sceneRect.width, sceneRect.height];
+                    }
+                }
+            }
+
+            Connections {
+                target: sceneView
+                function onItemSelectionModeChanged() {
+                    if (!sceneView.itemSelectionMode) root.nlSelRect = null;
+                }
+            }
+
+            function nlTakeSelection() {
+                if (!root.nlSelRect || !document) return null;
+                let items = null;
+                try {
+                    items = sceneView.controller.cloneSelectedItems(sceneView.controller.currentLayer, sceneView.defaultScale);
+                } catch (e) {
+                    items = null;
+                }
+                const cap = {
+                    pageId: String(root.currentPageId),
+                    page: root.currentPage,
+                    rect: root.nlSelRect.slice(0),
+                    items: items
+                };
+                root.nlSelRect = null;
+                try {
+                    sceneView.endItemSelection();
+                    sceneView.controller.clearSelectedItems();
+                } catch (e) {
+                }
+                return cap;
+            }
+
+            // ================= noteLinks: handwriting recognition =================
+            function nlCanRecognize() {
+                try {
+                    const tool = sceneView.hwcSelectionTool;
+                    if (!tool || typeof tool.nlStart !== "function") return false;
+                    if (tool.visible || tool.processing) return false;
+                    return Boolean(Authentication.loggedIn);
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            function nlRecognize(items, cb) {
+                if (!items || !nlCanRecognize()) {
+                    cb("");
+                    return;
+                }
+                try {
+                    root.nlHwcCb = cb;
+                    root.nlHwcTicks = 0;
+                    if (sceneView.hwcSelectionTool.nlStart(items)) {
+                        nlHwcTimer.restart();
+                    } else {
+                        nlHwcEnd("");
+                    }
+                } catch (e) {
+                    nlHwcEnd("");
+                }
+            }
+
+            function nlHwcPoll() {
+                root.nlHwcTicks++;
+                let state = "error";
+                try {
+                    state = sceneView.hwcSelectionTool.nlJobState();
+                } catch (e) {
+                    state = "error";
+                }
+                if (state === "done") {
+                    let t = "";
+                    try {
+                        t = sceneView.hwcSelectionTool.nlJobText();
+                    } catch (e) {
+                        t = "";
+                    }
+                    nlHwcEnd(t);
+                } else if (state === "error" || root.nlHwcTicks > 60) {
+                    nlHwcEnd("");
+                }
+            }
+
+            function nlHwcEnd(t) {
+                nlHwcTimer.stop();
+                nlSilentReset.restart();
+                const cb = root.nlHwcCb;
+                root.nlHwcCb = null;
+                if (cb) cb(String(t || "").replace(new RegExp("\\s+", "g"), " ").trim());
+            }
+
+            Timer {
+                id: nlHwcTimer
+                interval: 400
+                repeat: true
+                onTriggered: root.nlHwcPoll()
+            }
+
+            Timer {
+                id: nlSilentReset
+                interval: 2500
+                onTriggered: {
+                    if (sceneView.hwcSelectionTool && sceneView.hwcSelectionTool.nlSilent !== undefined) {
+                        sceneView.hwcSelectionTool.nlSilent = false;
+                    }
+                }
+            }
+
+            Timer {
+                id: nlToastTimer
+                interval: 3500
+                onTriggered: root.nlToast = ""
+            }
+
+            // ================= noteLinks: links =================
+            function nlBeginLink() {
+                const cap = nlTakeSelection();
+                if (!cap) return;
+                const link = {
+                    id: nlNewId(),
+                    pageId: cap.pageId,
+                    pageNo: cap.page + 1,
+                    rect: cap.rect,
+                    targetDoc: "",
+                    targetPage: "",
+                    targetPageNo: 0,
+                    targetName: "",
+                    label: ""
+                };
+                root.nlCapture = link;
+                nlRecognize(cap.items, (text) => {
+                    if (text === "") return;
+                    link.label = text.length > 60 ? text.substring(0, 57) + "..." : text;
+                    if (link.targetDoc !== "") nlSave();
+                });
+                nlOpenPicker();
+            }
+
+            function nlOpenPicker() {
+                root.nlPickerStage = "doc";
+                root.nlPickerDoc = "";
+                root.nlPickerPages = [];
+                nlPickerInput.text = "";
+                nlRefreshDocs("");
+                root.nlPickerOpen = true;
+            }
+
+            function nlEnsureLib() {
+                if (root.nlLib) return root.nlLib;
+                try {
+                    root.nlLib = Qt.createQmlObject(
+                        "import QtQuick; import com.remarkable; import xofm.libs.library; import xofm.bindings.qt; " +
+                        "LibrarySearch { filter: LibraryView.Documents; sortOrder: LibraryView.RecentlyOpenedDate; " +
+                        "library: Library; showRecentsIfTermEmpty: true; maximumResults: 40 }",
+                        root, "noteLinksLibrarySearch");
+                } catch (e) {
+                    console.log("noteLinks: LibrarySearch unavailable " + e);
+                    root.nlLib = null;
+                }
+                return root.nlLib;
+            }
+
+            function nlRefreshDocs(term) {
+                const lib = nlEnsureLib();
+                if (lib) {
+                    try {
+                        lib.searchTerm = term;
+                    } catch (e) {
+                    }
+                    try {
+                        lib.updateNow();
+                    } catch (e) {
+                    }
+                }
+                nlDocsTimer.restart();
+            }
+
+            Timer {
+                id: nlDocsTimer
+                interval: 350
+                onTriggered: root.nlCollectDocs()
+            }
+
+            function nlCollectDocs() {
+                const seen = {};
+                const out = [];
+                const term = nlPickerInput.text.trim().toLowerCase();
+                const add = (id) => {
+                    id = String(id);
+                    if (seen[id] || id === root.nlDocId) return;
+                    const e = Library.entryForId(id);
+                    if (!e) return;
+                    if (term !== "" && e.visibleName.toLowerCase().indexOf(term) < 0) return;
+                    seen[id] = true;
+                    out.push({ id: id, name: e.visibleName });
+                };
+                try {
+                    if (root.nlLib && root.nlLib.entryIds) {
+                        for (const id of root.nlLib.entryIds) add(id);
+                    }
+                } catch (e) {
+                }
+                if (root.nlIndex) {
+                    for (const id in root.nlIndex.docs) add(id);
+                }
+                root.nlPickerDocs = out.slice(0, 40);
+            }
+
+            function nlPickDoc(docId, name) {
+                root.nlPickerDoc = docId;
+                root.nlPickerDocName = name;
+                root.nlPickerStage = "page";
+                root.nlPickerPages = [];
+                root.nlPickerNote = "";
+                root.nlPickerLast = -1;
+                nlPageInput.text = "";
+                const entry = Library.entryForId(docId);
+                root.nlPickerEntry = entry;
+                let count = 0;
+                if (docId === root.nlDocId) {
+                    count = root.pageCount;
+                    root.nlPickerLast = root.currentPage;
+                } else if (entry) {
+                    count = Number(entry.pageCount) || 0;
+                    root.nlPickerLast = Number(entry.lastOpenedPage);
+                    if (entry.archived) {
+                        root.nlPickerNote = "This notebook isn't downloaded on the tablet. You can still link to the whole notebook.";
+                    }
+                }
+                const makePages = (n, ids) => {
+                    const pages = [];
+                    for (let i = 0; i < n; i++) pages.push({ i: i, id: ids && i < ids.length ? ids[i] : "" });
+                    return pages;
+                };
+                if (docId === root.nlDocId) {
+                    const ids = [];
+                    for (let i = 0; i < count; i++) ids.push(String(document.idForPage(i)));
+                    root.nlPickerPages = makePages(count, ids);
+                    nlPickerScroll.restart();
+                    return;
+                }
+                if (count > 0) {
+                    root.nlPickerPages = makePages(count, null);
+                    nlPickerScroll.restart();
+                }
+                nlPickerGiveUp.restart();
+                nlGet(nlRoot + docId + ".content", (text) => {
+                    if (root.nlPickerDoc !== docId) return;
+                    let ids = [];
+                    try {
+                        const c = JSON.parse(text);
+                        if (c.cPages && c.cPages.pages) {
+                            let live = c.cPages.pages.filter(p => !(p.deleted && p.deleted.value === 1));
+                            live.sort((x, y) => {
+                                const u = (x.idx && x.idx.value) || "";
+                                const v = (y.idx && y.idx.value) || "";
+                                return u < v ? -1 : (u > v ? 1 : 0);
+                            });
+                            ids = live.map(q => String(q.id));
+                        } else if (Array.isArray(c.pages)) {
+                            ids = c.pages.map(q => String(q));
+                        }
+                        if (count === 0 && ids.length === 0 && c.pageCount) count = Number(c.pageCount) || 0;
+                    } catch (e) {
+                        ids = [];
+                    }
+                    if (count === 0) count = ids.length;
+                    if (count > 0) {
+                        const first = root.nlPickerPages.length === 0;
+                        root.nlPickerPages = makePages(count, ids);
+                        if (first) nlPickerScroll.restart();
+                    }
+                });
+            }
+
+            Timer {
+                id: nlPickerGiveUp
+                interval: 3000
+                onTriggered: {
+                    if (root.nlPickerStage === "page" && root.nlPickerPages.length === 0 && root.nlPickerNote === "") {
+                        root.nlPickerNote = "Couldn't read this notebook's pages. Link to the whole notebook, or type a page number above.";
+                    }
+                }
+            }
+
+            Timer {
+                id: nlPickerScroll
+                interval: 150
+                onTriggered: {
+                    if (root.nlPickerLast > 0 && root.nlPickerLast < root.nlPickerPages.length) {
+                        nlPageGrid.positionViewAtIndex(root.nlPickerLast, GridView.Center);
+                    } else {
+                        nlPageGrid.positionViewAtBeginning();
+                    }
+                }
+            }
+
+            function nlLinkToPageNumber(text) {
+                const n = parseInt(String(text).trim(), 10);
+                Qt.inputMethod.hide();
+                if (isNaN(n) || n < 1) return;
+                const pages = root.nlPickerPages;
+                if (pages.length > 0 && n > pages.length) {
+                    nlShowToast("This notebook has " + pages.length + " pages");
+                    return;
+                }
+                const pg = pages.length >= n ? pages[n - 1] : { i: n - 1, id: "" };
+                nlFinishLink(pg.id, pg.i);
+            }
+
+            function nlMakeThumb(holder, entry, pageIndex) {
+                if (!entry || !holder) return null;
+                try {
+                    const t = Qt.createQmlObject(
+                        "import QtQuick; import com.remarkable; import device.view.navigator; import device.ui.controls; " +
+                        "PageThumbnail { anchors.fill: parent; asynchronous: true }",
+                        holder, "noteLinksThumb");
+                    t.document = entry;
+                    t.documentId = entry.id;
+                    t.page = pageIndex;
+                    t.sourceSize = Qt.size(holder.width, holder.height);
+                    return t;
+                } catch (e) {
+                    console.log("noteLinks: PageThumbnail unavailable " + e);
+                    root.nlThumbsOff = true;
+                    return null;
+                }
+            }
+
+            function nlFinishLink(pageId, pageIndex) {
+                const link = root.nlCapture;
+                root.nlPickerOpen = false;
+                if (!link || !root.nlData) return;
+                link.targetDoc = root.nlPickerDoc;
+                link.targetPage = pageId;
+                link.targetPageNo = pageIndex + 1;
+                link.targetName = root.nlPickerDocName;
+                root.nlData.links.push(link);
+                root.nlCapture = null;
+                nlSave();
+                nlShowToast("Linked to " + link.targetName + (pageIndex >= 0 ? " p." + (pageIndex + 1) : ""));
+            }
+
+            function nlGoTo(docId, pageId, pageHint, remember) {
+                if (remember && document) {
+                    root.nlBack = {
+                        docId: root.nlDocId,
+                        pageId: String(root.currentPageId),
+                        page: root.currentPage,
+                        name: document.visibleName
+                    };
+                }
+                if (docId === root.nlDocId) {
+                    let idx = pageId ? document.pageForId(pageId) : -1;
+                    if ((typeof idx !== "number" || idx < 0) && pageHint > 0) idx = pageHint - 1;
+                    if (typeof idx === "number" && idx >= 0 && idx < root.pageCount) {
+                        root.openPage(idx);
+                        root.nlBackShown = remember;
+                        if (remember) nlBackTimer.restart();
+                    } else if (pageId) {
+                        nlShowToast("That page was deleted");
+                    }
+                    return;
+                }
+                const entry = Library.entryForId(docId);
+                if (!entry) {
+                    nlShowToast("The linked notebook was deleted");
+                    return;
+                }
+                if (entry.archived) {
+                    nlShowToast("Download \"" + entry.visibleName + "\" to this tablet first");
+                    return;
+                }
+                root.nlPending = { docId: docId, pageId: pageId, hint: pageHint, back: remember };
+                root.nlPanelOpen = false;
+                navigator.requestOpenDocumentOnPage(entry, pageHint > 0 ? pageHint - 1 : 0);
+            }
+
+            Timer {
+                id: nlPendingTimer
+                interval: 300
+                repeat: true
+                onTriggered: {
+                    root.nlPendingTicks++;
+                    const p = root.nlPending;
+                    if (!p || p.docId !== root.nlDocId || root.nlPendingTicks > 20) {
+                        stop();
+                        root.nlPending = null;
+                        return;
+                    }
+                    if (root.pageCount <= 0) return;
+                    if (p.pageId) {
+                        const idx = document.pageForId(p.pageId);
+                        if (typeof idx !== "number" || idx < 0) {
+                            if (root.nlPendingTicks > 8) {
+                                stop();
+                                root.nlPending = null;
+                                root.nlShowToast("That page was deleted");
+                            }
+                            return;
+                        }
+                        if (idx !== root.currentPage) root.openPage(idx);
+                    }
+                    stop();
+                    root.nlPending = null;
+                    root.nlBackShown = p.back;
+                    if (p.back) nlBackTimer.restart();
+                }
+            }
+
+            Timer {
+                id: nlBackTimer
+                interval: 30000
+                onTriggered: root.nlBackShown = false
+            }
+
+            function nlFollow(link) {
+                nlGoTo(link.targetDoc, link.targetPage, link.targetPageNo, true);
+            }
+
+            function nlGoBack() {
+                const b = root.nlBack;
+                root.nlBackShown = false;
+                root.nlBack = null;
+                if (b) nlGoTo(b.docId, b.pageId, b.page + 1, false);
+            }
+
+            function nlRemove(entry) {
+                root.nlMenuItem = null;
+                if (!entry || !root.nlData) return;
+                const item = entry.item;
+                if (entry.kind === "link") {
+                    root.nlData.links = root.nlData.links.filter(l => l.id !== item.id);
+                } else {
+                    root.nlData.tags = root.nlData.tags.filter(t => t.id !== item.id);
+                    const stillThere = root.nlData.tags.some(t => t.pageId === item.pageId && t.tag === item.tag);
+                    if (item.addedNative && !stillThere) {
+                        const idx = document.pageForId(item.pageId);
+                        if (typeof idx === "number" && idx >= 0) nlSetPageTag(idx, item.tag, false);
+                    }
+                }
+                nlSave();
+            }
+
+            // ================= noteLinks: tags =================
+            function nlCleanTag(s) {
+                return String(s || "").replace(new RegExp("^#+"), "").replace(new RegExp("\\s+", "g"), " ").trim().substring(0, 40);
+            }
+
+            function nlAllTagLabels() {
+                const set = {};
+                try {
+                    const labels = Library.tagLabels();
+                    for (const t of labels) {
+                        const name = typeof t === "string" ? t : (t.name || t.label || "");
+                        if (name) set[name] = true;
+                    }
+                } catch (e) {
+                }
+                if (root.nlIndex) {
+                    for (const id in root.nlIndex.docs) {
+                        for (const t of (root.nlIndex.docs[id].tags || [])) set[t.tag] = true;
+                    }
+                }
+                return Object.keys(set).sort((a, b) => a.toLowerCase() < b.toLowerCase() ? -1 : 1);
+            }
+
+            function nlBeginTag() {
+                const cap = nlTakeSelection();
+                if (!cap) return;
+                root.nlCapture = cap;
+                root.nlTagSuggestion = "";
+                root.nlTagTyped = false;
+                nlTagInput.text = "";
+                root.nlTagChoices = nlAllTagLabels();
+                root.nlTagOpen = true;
+                nlRecognize(cap.items, (text) => {
+                    const words = text.split(" ");
+                    const hashed = words.filter(w => w.charAt(0) === "#");
+                    const t = nlCleanTag(hashed.length > 0 ? hashed[0] : words.slice(0, 3).join(" "));
+                    root.nlTagSuggestion = t;
+                    if (t !== "" && root.nlTagOpen && !root.nlTagTyped && nlTagInput.text === "") {
+                        nlTagInput.text = t;
+                    }
+                });
+            }
+
+            function nlSetPageTag(pageIndex, tag, add) {
+                try {
+                    let current = [];
+                    const existing = document.tagsForPage(pageIndex) || [];
+                    for (const t of existing) current.push(typeof t === "string" ? t : (t.name || t.label || ""));
+                    current = current.filter(t => t !== "");
+                    const has = current.indexOf(tag) >= 0;
+                    if (add && has) return false;
+                    if (!add && !has) return false;
+                    const next = add ? current.concat([tag]) : current.filter(t => t !== tag);
+                    LibraryController.setPageTags(document.id, [pageIndex], next, []);
+                    const map = root.pageTagMap;
+                    const newTags = document.tagsForPage(pageIndex);
+                    map[pageIndex] = newTags.length ? newTags : undefined;
+                    root.pageTagMap = map;
+                    if (pageIndex === root.currentPage) root.isTagged = newTags.length > 0;
+                    return true;
+                } catch (e) {
+                    console.log("noteLinks: page tag failed " + e);
+                    return false;
+                }
+            }
+
+            function nlFinishTag(raw) {
+                const tag = nlCleanTag(raw);
+                const cap = root.nlCapture;
+                root.nlTagOpen = false;
+                Qt.inputMethod.hide();
+                if (tag === "" || !cap || !root.nlData) return;
+                let pageIndex = document.pageForId(cap.pageId);
+                if (typeof pageIndex !== "number" || pageIndex < 0) pageIndex = cap.page;
+                const added = nlSetPageTag(pageIndex, tag, true);
+                root.nlData.tags.push({
+                    id: nlNewId(),
+                    pageId: cap.pageId,
+                    pageNo: pageIndex + 1,
+                    rect: cap.rect,
+                    tag: tag,
+                    addedNative: added
+                });
+                root.nlCapture = null;
+                nlSave();
+                nlShowToast("Tagged #" + tag);
+            }
+
+            // ================= noteLinks: panel data =================
+            function nlTogglePanel() {
+                root.nlMenuItem = null;
+                if (root.nlPanelOpen) {
+                    root.nlPanelOpen = false;
+                    return;
+                }
+                nlLoadIndex(() => {
+                    nlSyncIndex(false);
+                    root.nlRev++;
+                    root.nlPanelOpen = true;
+                });
+            }
+
+            property var nlOutgoing: {
+                root.nlRev;
+                const out = [];
+                if (!root.nlData) return out;
+                const pid = String(root.currentPageId);
+                for (const l of root.nlData.links) {
+                    if (l.pageId === pid) out.push(l);
+                }
+                return out;
+            }
+
+            property var nlNotebookLinks: {
+                root.nlRev;
+                const out = [];
+                if (!root.nlData) return out;
+                const pid = String(root.currentPageId);
+                for (const l of root.nlData.links) {
+                    if (l.pageId !== pid) out.push(l);
+                }
+                out.sort((a, b) => root.nlPageNo(a.pageId) - root.nlPageNo(b.pageId));
+                return out;
+            }
+
+            property var nlIncoming: {
+                root.nlRev;
+                const out = [];
+                if (!root.nlIndex || root.nlDocId === "") return out;
+                const pid = String(root.currentPageId);
+                for (const id in root.nlIndex.docs) {
+                    const d = root.nlIndex.docs[id];
+                    for (const l of (d.links || [])) {
+                        if (l.targetDoc !== root.nlDocId) continue;
+                        if (l.targetPage && l.targetPage !== pid) continue;
+                        out.push({ docId: id, docName: d.name, link: l });
+                    }
+                }
+                return out;
+            }
+
+            property var nlTagIndex: {
+                root.nlRev;
+                const groups = {};
+                if (!root.nlIndex) return [];
+                for (const id in root.nlIndex.docs) {
+                    const d = root.nlIndex.docs[id];
+                    for (const t of (d.tags || [])) {
+                        if (!groups[t.tag]) groups[t.tag] = [];
+                        groups[t.tag].push({ docId: id, docName: d.name, tag: t });
+                    }
+                }
+                return Object.keys(groups)
+                    .sort((a, b) => a.toLowerCase() < b.toLowerCase() ? -1 : 1)
+                    .map(k => ({ tag: k, hits: groups[k] }));
+            }
+            property var nlLinkSections: {
+                root.nlRev;
+                const here = root.nlDocId;
+                const outRows = root.nlOutgoing.map(l => ({
+                    title: root.nlDocName(l.targetDoc, l.targetName),
+                    page: l.targetPageNo > 0 ? "p. " + l.targetPageNo : "whole notebook",
+                    quote: l.label || "",
+                    docId: l.targetDoc, pageId: l.targetPage, pageNo: l.targetPageNo
+                }));
+                const inRows = root.nlIncoming.map(x => ({
+                    title: x.docId === here ? "This notebook" : (x.docName || "Notebook"),
+                    page: x.link.pageNo > 0 ? "p. " + x.link.pageNo : "",
+                    quote: x.link.label || "",
+                    docId: x.docId, pageId: x.link.pageId, pageNo: x.link.pageNo
+                }));
+                const nbRows = root.nlNotebookLinks.map(l => ({
+                    title: root.nlDocName(l.targetDoc, l.targetName),
+                    page: "on p. " + root.nlPageNo(l.pageId),
+                    quote: l.label || "",
+                    docId: here, pageId: l.pageId, pageNo: root.nlPageNo(l.pageId)
+                }));
+                return [
+                    { title: "FROM THIS PAGE", empty: "No links yet. Lasso some writing and tap Link.", rows: outRows },
+                    { title: "LINKED FROM", empty: "Nothing links to this page yet.", rows: inRows },
+                    { title: "ELSEWHERE IN THIS NOTEBOOK", empty: "No other links in this notebook.", rows: nbRows }
+                ];
+            }
+
+            // ================= noteLinks: look =================
+            readonly property string nlSerif: "EB Garamond"
+            readonly property int nlHair: 2
+
+            // ================= noteLinks: on-page layer =================
+            Item {
+                id: nlPageLayer
+                parent: sceneView.uiOverlay
+                anchors.fill: parent
+                z: 200
+                visible: {
+                    return Boolean(root.document) && root.nlPickerOpen === false && root.nlTagOpen === false;
+                }
+
+                // link badges and tag markers
+                Repeater {
+                    model: root.nlPageItems
+                    delegate: Item {
+                        id: nlBadge
+                        required property var modelData
+                        readonly property bool isLink: modelData.kind === "link"
+                        readonly property rect vr: {
+                            if (sceneView.tileManager) sceneView.tileManager.sceneToViewTransform;
+                            return root.nlToView(modelData.item.rect);
+                        }
+                        x: vr.x + vr.width + 14
+                        y: vr.y + vr.height / 2 - height / 2
+                        width: isLink ? 64 : nlTagText.implicitWidth + 44
+                        height: 64
+
+                        Rectangle {
+                            visible: nlBadge.isLink
+                            anchors.fill: parent
+                            radius: 32
+                            color: "black"
+                            Canvas {
+                                anchors.fill: parent
+                                onPaint: {
+                                    const c = getContext("2d");
+                                    c.reset();
+                                    c.strokeStyle = "white";
+                                    c.lineWidth = 4;
+                                    c.lineCap = "round";
+                                    c.lineJoin = "round";
+                                    c.beginPath();
+                                    c.moveTo(22, 42);
+                                    c.lineTo(42, 22);
+                                    c.moveTo(27, 22);
+                                    c.lineTo(42, 22);
+                                    c.lineTo(42, 37);
+                                    c.stroke();
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            visible: nlBadge.isLink === false
+                            anchors.fill: parent
+                            anchors.topMargin: 4
+                            anchors.bottomMargin: 4
+                            radius: height / 2
+                            color: "white"
+                            border.color: "black"
+                            border.width: root.nlHair
+                            Text {
+                                id: nlTagText
+                                anchors.centerIn: parent
+                                text: "#" + (nlBadge.modelData.item.tag || "")
+                                font.family: root.nlSerif
+                                font.italic: true
+                                font.pixelSize: 32
+                                color: "black"
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -12
+                            onClicked: {
+                                if (nlBadge.isLink) {
+                                    root.nlFollow(nlBadge.modelData.item);
+                                } else {
+                                    root.nlOpenTag = nlBadge.modelData.item.tag;
+                                    root.nlPanelTab = "tags";
+                                    root.nlTogglePanel();
+                                }
+                            }
+                            onPressAndHold: {
+                                root.nlMenuItem = {
+                                    entry: nlBadge.modelData,
+                                    x: nlBadge.x,
+                                    y: nlBadge.y + nlBadge.height + 12
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // lasso capsule: Link | Tag
+                Rectangle {
+                    id: nlChips
+                    visible: {
+                        return root.nlSelRect !== null && sceneView.itemSelectionMode;
+                    }
+                    readonly property rect sel: {
+                        if (sceneView.tileManager) sceneView.tileManager.sceneToViewTransform;
+                        return root.nlToView(root.nlSelRect);
+                    }
+                    width: 330
+                    height: 84
+                    radius: 42
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    x: {
+                        const right = sel.x + sel.width + 48;
+                        return right + width < nlPageLayer.width - 24 ? right : Math.max(24, sel.x - width - 48);
+                    }
+                    y: Math.max(24, Math.min(sel.y + sel.height / 2 - height / 2, nlPageLayer.height - height - 24))
+
+                    Row {
+                        anchors.fill: parent
+                        Item {
+                            width: parent.width / 2
+                            height: parent.height
+                            Row {
+                                anchors.centerIn: parent
+                                spacing: 12
+                                Canvas {
+                                    width: 30
+                                    height: 30
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    onPaint: {
+                                        const c = getContext("2d");
+                                        c.reset();
+                                        c.strokeStyle = "black";
+                                        c.lineWidth = 3.5;
+                                        c.lineCap = "round";
+                                        c.lineJoin = "round";
+                                        c.beginPath();
+                                        c.moveTo(6, 24);
+                                        c.lineTo(24, 6);
+                                        c.moveTo(10, 6);
+                                        c.lineTo(24, 6);
+                                        c.lineTo(24, 20);
+                                        c.stroke();
+                                    }
+                                }
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: "Link"
+                                    font.family: root.nlSerif
+                                    font.pixelSize: 38
+                                    color: "black"
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: root.nlBeginLink()
+                            }
+                        }
+                        Rectangle {
+                            width: root.nlHair
+                            height: parent.height - 28
+                            anchors.verticalCenter: parent.verticalCenter
+                            color: "black"
+                        }
+                        Item {
+                            width: parent.width / 2 - root.nlHair
+                            height: parent.height
+                            Text {
+                                anchors.centerIn: parent
+                                text: "# Tag"
+                                font.family: root.nlSerif
+                                font.pixelSize: 38
+                                color: "black"
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: root.nlBeginTag()
+                            }
+                        }
+                    }
+                }
+
+                // long-press menu on a badge
+                Rectangle {
+                    visible: {
+                        return root.nlMenuItem !== null;
+                    }
+                    x: root.nlMenuItem ? Math.min(root.nlMenuItem.x, nlPageLayer.width - width - 24) : 0
+                    y: root.nlMenuItem ? root.nlMenuItem.y : 0
+                    width: 340
+                    height: nlMenuCol.height
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    radius: 16
+
+                    Column {
+                        id: nlMenuCol
+                        width: parent.width
+                        Repeater {
+                            model: ["Remove", "Cancel"]
+                            delegate: Item {
+                                required property var modelData
+                                required property int index
+                                width: nlMenuCol.width
+                                height: 92
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: 32
+                                    text: {
+                                        if (index === 1) return "Cancel";
+                                        const e = root.nlMenuItem ? root.nlMenuItem.entry : null;
+                                        return e && e.kind === "tag" ? "Remove tag" : "Remove link";
+                                    }
+                                    font.family: root.nlSerif
+                                    font.pixelSize: 34
+                                    font.italic: index === 1
+                                    color: "black"
+                                }
+                                Rectangle {
+                                    visible: index === 0
+                                    anchors.bottom: parent.bottom
+                                    x: 24
+                                    width: parent.width - 48
+                                    height: root.nlHair
+                                    color: "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        if (index === 0) {
+                                            root.nlRemove(root.nlMenuItem ? root.nlMenuItem.entry : null);
+                                        } else {
+                                            root.nlMenuItem = null;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ================= noteLinks: overlays (above toolbar) =================
+            Item {
+                id: nlOverlay
+                anchors.fill: parent
+                z: 900
+
+                // Back pill
+                Rectangle {
+                    visible: {
+                        return root.nlBackShown && root.nlBack !== null;
+                    }
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    y: 140
+                    width: nlBackRow.width + 76
+                    height: 80
+                    radius: 40
+                    color: "black"
+                    Row {
+                        id: nlBackRow
+                        anchors.centerIn: parent
+                        spacing: 16
+                        Canvas {
+                            width: 30
+                            height: 30
+                            anchors.verticalCenter: parent.verticalCenter
+                            onPaint: {
+                                const c = getContext("2d");
+                                c.reset();
+                                c.strokeStyle = "white";
+                                c.lineWidth = 3.5;
+                                c.lineCap = "round";
+                                c.lineJoin = "round";
+                                c.beginPath();
+                                c.moveTo(26, 15);
+                                c.lineTo(5, 15);
+                                c.moveTo(13, 6);
+                                c.lineTo(4, 15);
+                                c.lineTo(13, 24);
+                                c.stroke();
+                            }
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.nlBack ? "Back to " + root.nlBack.name + ", p. " + (root.nlBack.page + 1) : ""
+                            color: "white"
+                            font.family: root.nlSerif
+                            font.pixelSize: 34
+                            elide: Text.ElideRight
+                            width: Math.min(implicitWidth, nlOverlay.width - 300)
+                        }
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -10
+                        onClicked: root.nlGoBack()
+                    }
+                }
+
+                // Toast
+                Rectangle {
+                    visible: {
+                        return root.nlToast !== "";
+                    }
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 180
+                    width: nlToastText.implicitWidth + 80
+                    height: 80
+                    radius: 40
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    Text {
+                        id: nlToastText
+                        anchors.centerIn: parent
+                        text: root.nlToast
+                        color: "black"
+                        font.family: root.nlSerif
+                        font.italic: true
+                        font.pixelSize: 34
+                    }
+                }
+
+                // ---------- Link picker ----------
+                MouseArea {
+                    anchors.fill: parent
+                    visible: root.nlPickerOpen
+                    onClicked: {
+                        root.nlPickerOpen = false;
+                        root.nlCapture = null;
+                        Qt.inputMethod.hide();
+                    }
+                }
+
+                Rectangle {
+                    id: nlPicker
+                    visible: root.nlPickerOpen
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    y: 110
+                    width: Math.min(parent.width - 120, 1160)
+                    height: parent.height - 220 - (Qt.inputMethod.visible ? Qt.inputMethod.keyboardRectangle.height : 0)
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    radius: 20
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Item {
+                        id: nlPickerHead
+                        x: 56
+                        y: 40
+                        width: parent.width - 112
+                        height: 112
+                        Text {
+                            id: nlPickerKicker
+                            text: root.nlPickerStage === "doc" ? "LINK TO" : "CHOOSE A PAGE"
+                            font.family: root.nlSerif
+                            font.pixelSize: 22
+                            font.letterSpacing: 6
+                            color: "black"
+                        }
+                        Text {
+                            anchors.top: nlPickerKicker.bottom
+                            anchors.topMargin: 4
+                            text: root.nlPickerStage === "doc" ? "Which notebook?" : root.nlPickerDocName
+                            font.family: root.nlSerif
+                            font.pixelSize: 56
+                            color: "black"
+                            elide: Text.ElideRight
+                            width: parent.width - 200
+                        }
+                        Text {
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.topMargin: 20
+                            text: root.nlPickerStage === "doc" ? "Cancel" : "Back"
+                            font.family: root.nlSerif
+                            font.italic: true
+                            font.pixelSize: 34
+                            color: "black"
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -20
+                                onClicked: {
+                                    if (root.nlPickerStage === "doc") {
+                                        root.nlPickerOpen = false;
+                                        root.nlCapture = null;
+                                        Qt.inputMethod.hide();
+                                    } else {
+                                        root.nlPickerStage = "doc";
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        id: nlPickerRule
+                        anchors.top: nlPickerHead.bottom
+                        anchors.topMargin: 16
+                        x: 56
+                        width: parent.width - 112
+                        height: root.nlHair
+                        color: "black"
+                    }
+
+                    // stage 1: notebooks
+                    Item {
+                        visible: root.nlPickerStage === "doc"
+                        anchors.top: nlPickerRule.bottom
+                        anchors.topMargin: 28
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: 32
+                        x: 56
+                        width: parent.width - 112
+
+                        Rectangle {
+                            id: nlSearchBox
+                            width: parent.width
+                            height: 88
+                            radius: 44
+                            border.color: "black"
+                            border.width: root.nlHair
+                            color: "white"
+                            Text {
+                                visible: nlPickerInput.text === ""
+                                anchors.verticalCenter: parent.verticalCenter
+                                x: 40
+                                text: "Search notebooks"
+                                color: "#555555"
+                                font.family: root.nlSerif
+                                font.italic: true
+                                font.pixelSize: 34
+                            }
+                            GeneralTextInput {
+                                id: nlPickerInput
+                                anchors.fill: parent
+                                anchors.leftMargin: 40
+                                anchors.rightMargin: 40
+                                verticalAlignment: TextInput.AlignVCenter
+                                font.pixelSize: 32
+                                color: "black"
+                                selectedTextColor: "white"
+                                selectionColor: "black"
+                                inputMethodHints: Qt.ImhNoPredictiveText
+                                onTextChanged: root.nlRefreshDocs(text)
+                                onAccepted: Qt.inputMethod.hide()
+                            }
+                        }
+
+                        Flickable {
+                            anchors.top: nlSearchBox.bottom
+                            anchors.topMargin: 20
+                            anchors.bottom: parent.bottom
+                            width: parent.width
+                            clip: true
+                            contentHeight: nlDocCol.height
+                            boundsBehavior: Flickable.StopAtBounds
+
+                            Column {
+                                id: nlDocCol
+                                width: parent.width
+                                Repeater {
+                                    model: {
+                                        const here = root.document ? [{ id: root.nlDocId, name: root.document.visibleName, here: true }] : [];
+                                        return here.concat(root.nlPickerDocs);
+                                    }
+                                    delegate: Item {
+                                        required property var modelData
+                                        required property int index
+                                        width: nlDocCol.width
+                                        height: 112
+                                        Column {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            x: 4
+                                            width: parent.width - 80
+                                            Text {
+                                                width: parent.width
+                                                text: modelData.name
+                                                font.family: root.nlSerif
+                                                font.pixelSize: 40
+                                                elide: Text.ElideRight
+                                                color: "black"
+                                            }
+                                            Text {
+                                                visible: modelData.here === true
+                                                text: "this notebook"
+                                                font.family: root.nlSerif
+                                                font.italic: true
+                                                font.pixelSize: 28
+                                                color: "black"
+                                            }
+                                        }
+                                        Canvas {
+                                            anchors.right: parent.right
+                                            anchors.rightMargin: 8
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            width: 22
+                                            height: 36
+                                            onPaint: {
+                                                const c = getContext("2d");
+                                                c.reset();
+                                                c.strokeStyle = "black";
+                                                c.lineWidth = 3;
+                                                c.lineCap = "round";
+                                                c.beginPath();
+                                                c.moveTo(4, 4);
+                                                c.lineTo(18, 18);
+                                                c.lineTo(4, 32);
+                                                c.stroke();
+                                            }
+                                        }
+                                        Rectangle {
+                                            anchors.bottom: parent.bottom
+                                            width: parent.width
+                                            height: 1
+                                            color: "black"
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked: {
+                                                Qt.inputMethod.hide();
+                                                root.nlPickDoc(modelData.id, modelData.name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // stage 2: pages
+                    Item {
+                        visible: root.nlPickerStage === "page"
+                        anchors.top: nlPickerRule.bottom
+                        anchors.topMargin: 28
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: 32
+                        x: 56
+                        width: parent.width - 112
+
+                        Row {
+                            id: nlPageTools
+                            width: parent.width
+                            spacing: 20
+                            Rectangle {
+                                width: parent.width - nlWholeDoc.width - 20
+                                height: 88
+                                radius: 44
+                                border.color: "black"
+                                border.width: root.nlHair
+                                Text {
+                                    visible: nlPageInput.text === ""
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: 40
+                                    text: root.nlPickerPages.length > 0 ? "Page number (1–" + root.nlPickerPages.length + ")" : "Page number"
+                                    color: "#555555"
+                                    font.family: root.nlSerif
+                                    font.italic: true
+                                    font.pixelSize: 32
+                                }
+                                GeneralTextInput {
+                                    id: nlPageInput
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 40
+                                    anchors.rightMargin: 120
+                                    verticalAlignment: TextInput.AlignVCenter
+                                    font.pixelSize: 32
+                                    color: "black"
+                                    selectedTextColor: "white"
+                                    selectionColor: "black"
+                                    inputMethodHints: Qt.ImhDigitsOnly
+                                    onAccepted: root.nlLinkToPageNumber(text)
+                                }
+                                Rectangle {
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: 10
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: 100
+                                    height: 68
+                                    radius: 34
+                                    color: "black"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "Link"
+                                        color: "white"
+                                        font.family: root.nlSerif
+                                        font.pixelSize: 30
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.nlLinkToPageNumber(nlPageInput.text)
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                id: nlWholeDoc
+                                visible: {
+                                    return root.nlPickerDoc !== root.nlDocId;
+                                }
+                                width: visible ? nlWholeText.implicitWidth + 64 : 0
+                                height: 88
+                                radius: 44
+                                border.color: "black"
+                                border.width: root.nlHair
+                                Text {
+                                    id: nlWholeText
+                                    anchors.centerIn: parent
+                                    text: "Whole notebook"
+                                    font.family: root.nlSerif
+                                    font.pixelSize: 32
+                                    color: "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.nlFinishLink("", -1)
+                                }
+                            }
+                        }
+
+                        Text {
+                            id: nlPickerNoteText
+                            visible: { return root.nlPickerNote !== ""; }
+                            anchors.top: nlPageTools.bottom
+                            anchors.topMargin: 24
+                            width: parent.width
+                            wrapMode: Text.WordWrap
+                            text: root.nlPickerNote
+                            font.family: root.nlSerif
+                            font.italic: true
+                            font.pixelSize: 30
+                            color: "black"
+                        }
+
+                        Text {
+                            visible: {
+                                return root.nlPickerPages.length === 0 && root.nlPickerNote === "";
+                            }
+                            anchors.centerIn: parent
+                            text: "Reading pages…"
+                            font.family: root.nlSerif
+                            font.italic: true
+                            font.pixelSize: 34
+                            color: "black"
+                        }
+
+                        GridView {
+                            id: nlPageGrid
+                            anchors.top: nlPickerNoteText.visible ? nlPickerNoteText.bottom : nlPageTools.bottom
+                            anchors.topMargin: 24
+                            anchors.bottom: parent.bottom
+                            width: parent.width
+                            clip: true
+                            cellWidth: width / 4
+                            cellHeight: cellWidth * 1.5
+                            cacheBuffer: 0
+                            boundsBehavior: Flickable.StopAtBounds
+                            model: root.nlPickerPages
+                            delegate: Item {
+                                id: nlPageCell
+                                required property var modelData
+                                required property int index
+                                width: nlPageGrid.cellWidth
+                                height: nlPageGrid.cellHeight
+                                readonly property bool isLast: modelData.i === root.nlPickerLast
+                                Rectangle {
+                                    id: nlThumbFrame
+                                    x: 14
+                                    y: 10
+                                    width: parent.width - 28
+                                    height: parent.height - 78
+                                    color: "white"
+                                    border.color: "black"
+                                    border.width: nlPageCell.isLast ? 4 : root.nlHair
+                                    radius: 6
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: String(nlPageCell.modelData.i + 1)
+                                        font.family: root.nlSerif
+                                        font.pixelSize: 72
+                                        color: "black"
+                                    }
+                                    Item {
+                                        id: nlThumbHolder
+                                        anchors.fill: parent
+                                        anchors.margins: root.nlHair
+                                        clip: true
+                                    }
+                                    Timer {
+                                        // build thumbnails only for cells that stay on screen briefly
+                                        interval: 220
+                                        running: { return root.nlThumbsOff === false && root.nlPickerEntry !== null; }
+                                        onTriggered: root.nlMakeThumb(nlThumbHolder, root.nlPickerEntry, nlPageCell.modelData.i)
+                                    }
+                                }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    anchors.top: nlThumbFrame.bottom
+                                    anchors.topMargin: 10
+                                    text: nlPageCell.isLast ? "p. " + (nlPageCell.modelData.i + 1) + " · last read" : "p. " + (nlPageCell.modelData.i + 1)
+                                    font.family: root.nlSerif
+                                    font.italic: nlPageCell.isLast
+                                    font.pixelSize: 30
+                                    color: "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.nlFinishLink(nlPageCell.modelData.id, nlPageCell.modelData.i)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---------- Tag dialog ----------
+                MouseArea {
+                    anchors.fill: parent
+                    visible: root.nlTagOpen
+                    onClicked: {
+                        root.nlTagOpen = false;
+                        root.nlCapture = null;
+                        Qt.inputMethod.hide();
+                    }
+                }
+
+                Rectangle {
+                    id: nlTagDialog
+                    visible: root.nlTagOpen
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    y: 160
+                    width: Math.min(parent.width - 160, 1040)
+                    height: nlTagCol.height + 88
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    radius: 20
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Column {
+                        id: nlTagCol
+                        x: 56
+                        y: 44
+                        width: parent.width - 112
+                        spacing: 28
+
+                        Column {
+                            width: parent.width
+                            spacing: 4
+                            Text {
+                                text: "TAG THIS SPOT"
+                                font.family: root.nlSerif
+                                font.pixelSize: 22
+                                font.letterSpacing: 6
+                                color: "black"
+                            }
+                            Text {
+                                text: "What is it about?"
+                                font.family: root.nlSerif
+                                font.pixelSize: 56
+                                color: "black"
+                            }
+                        }
+
+                        Rectangle {
+                            width: parent.width
+                            height: root.nlHair
+                            color: "black"
+                        }
+
+                        Rectangle {
+                            width: parent.width
+                            height: 92
+                            radius: 46
+                            border.color: "black"
+                            border.width: root.nlHair
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                x: 36
+                                text: "#"
+                                font.family: root.nlSerif
+                                font.pixelSize: 40
+                                color: "black"
+                            }
+                            Text {
+                                visible: nlTagInput.text === ""
+                                anchors.verticalCenter: parent.verticalCenter
+                                x: 76
+                                text: root.nlCanRecognize() ? "Reading your handwriting…" : "Type a tag"
+                                color: "#555555"
+                                font.family: root.nlSerif
+                                font.italic: true
+                                font.pixelSize: 34
+                            }
+                            GeneralTextInput {
+                                id: nlTagInput
+                                anchors.fill: parent
+                                anchors.leftMargin: 76
+                                anchors.rightMargin: 36
+                                verticalAlignment: TextInput.AlignVCenter
+                                font.pixelSize: 34
+                                color: "black"
+                                selectedTextColor: "white"
+                                selectionColor: "black"
+                                inputMethodHints: Qt.ImhNoPredictiveText
+                                onTextEdited: root.nlTagTyped = true
+                                onAccepted: root.nlFinishTag(text)
+                            }
+                        }
+
+                        Text {
+                            visible: root.nlTagChoices.length > 0
+                            text: "YOUR TAGS"
+                            font.family: root.nlSerif
+                            font.pixelSize: 22
+                            font.letterSpacing: 6
+                            color: "black"
+                        }
+
+                        Flow {
+                            width: parent.width
+                            spacing: 16
+                            Repeater {
+                                model: root.nlTagChoices.slice(0, 24)
+                                delegate: Rectangle {
+                                    required property var modelData
+                                    width: nlChoiceText.implicitWidth + 52
+                                    height: 68
+                                    radius: 34
+                                    color: "white"
+                                    border.color: "black"
+                                    border.width: root.nlHair
+                                    Text {
+                                        id: nlChoiceText
+                                        anchors.centerIn: parent
+                                        text: "#" + modelData
+                                        font.family: root.nlSerif
+                                        font.italic: true
+                                        font.pixelSize: 32
+                                        color: "black"
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: root.nlFinishTag(modelData)
+                                    }
+                                }
+                            }
+                        }
+
+                        Row {
+                            anchors.right: parent.right
+                            spacing: 24
+                            Rectangle {
+                                width: 220
+                                height: 80
+                                radius: 40
+                                border.color: "black"
+                                border.width: root.nlHair
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "Cancel"
+                                    font.family: root.nlSerif
+                                    font.italic: true
+                                    font.pixelSize: 34
+                                    color: "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        root.nlTagOpen = false;
+                                        root.nlCapture = null;
+                                        Qt.inputMethod.hide();
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                width: 220
+                                height: 80
+                                radius: 40
+                                color: "black"
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "Add tag"
+                                    font.family: root.nlSerif
+                                    font.pixelSize: 34
+                                    color: "white"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.nlFinishTag(nlTagInput.text)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---------- Links panel ----------
+                MouseArea {
+                    anchors.fill: parent
+                    visible: root.nlPanelOpen
+                    onClicked: root.nlPanelOpen = false
+                }
+
+                Rectangle {
+                    id: nlPanel
+                    visible: root.nlPanelOpen
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    width: Math.min(760, parent.width * 0.5)
+                    color: "white"
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        width: 3
+                        color: "black"
+                    }
+
+                    Text {
+                        id: nlPanelKicker
+                        x: 56
+                        y: 56
+                        text: root.document ? root.document.visibleName.toUpperCase() + "  ·  P. " + (root.currentPage + 1) : ""
+                        font.family: root.nlSerif
+                        font.pixelSize: 22
+                        font.letterSpacing: 5
+                        elide: Text.ElideRight
+                        width: parent.width - 220
+                        color: "black"
+                    }
+
+                    Text {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 48
+                        y: 48
+                        text: "Close"
+                        font.family: root.nlSerif
+                        font.italic: true
+                        font.pixelSize: 34
+                        color: "black"
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -20
+                            onClicked: root.nlPanelOpen = false
+                        }
+                    }
+
+                    Row {
+                        id: nlTabs
+                        x: 56
+                        anchors.top: nlPanelKicker.bottom
+                        anchors.topMargin: 20
+                        spacing: 48
+                        Repeater {
+                            model: [{ key: "links", label: "Links" }, { key: "tags", label: "Tags" }]
+                            delegate: Item {
+                                required property var modelData
+                                width: nlTabText.implicitWidth
+                                height: 92
+                                Text {
+                                    id: nlTabText
+                                    text: modelData.label
+                                    font.family: root.nlSerif
+                                    font.pixelSize: 56
+                                    font.italic: { return root.nlPanelTab !== modelData.key; }
+                                    color: "black"
+                                }
+                                Rectangle {
+                                    visible: root.nlPanelTab === modelData.key
+                                    anchors.bottom: parent.bottom
+                                    width: parent.width
+                                    height: 4
+                                    color: "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    anchors.margins: -12
+                                    onClicked: root.nlPanelTab = modelData.key
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        id: nlPanelRule
+                        anchors.top: nlTabs.bottom
+                        x: 56
+                        width: parent.width - 104
+                        height: root.nlHair
+                        color: "black"
+                    }
+
+                    Flickable {
+                        anchors.top: nlPanelRule.bottom
+                        anchors.topMargin: 12
+                        anchors.bottom: parent.bottom
+                        x: 56
+                        width: parent.width - 104
+                        clip: true
+                        contentHeight: nlPanelCol.height + 48
+                        boundsBehavior: Flickable.StopAtBounds
+
+                        Column {
+                            id: nlPanelCol
+                            width: parent.width
+
+                            // ---- Links tab ----
+                            Repeater {
+                                model: root.nlPanelTab === "links" ? root.nlLinkSections : []
+                                delegate: Column {
+                                    id: nlSection
+                                    required property var modelData
+                                    width: nlPanelCol.width
+                                    Item {
+                                        width: parent.width
+                                        height: 88
+                                        Text {
+                                            anchors.bottom: parent.bottom
+                                            anchors.bottomMargin: 14
+                                            text: nlSection.modelData.title
+                                            font.family: root.nlSerif
+                                            font.pixelSize: 22
+                                            font.letterSpacing: 6
+                                            color: "black"
+                                        }
+                                    }
+                                    Text {
+                                        visible: nlSection.modelData.rows.length === 0
+                                        width: parent.width
+                                        wrapMode: Text.WordWrap
+                                        text: nlSection.modelData.empty
+                                        font.family: root.nlSerif
+                                        font.italic: true
+                                        font.pixelSize: 30
+                                        color: "#555555"
+                                        bottomPadding: 12
+                                    }
+                                    Repeater {
+                                        model: nlSection.modelData.rows
+                                        delegate: Item {
+                                            required property var modelData
+                                            width: nlSection.width
+                                            height: { return modelData.quote !== "" ? 124 : 92; }
+                                            Column {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                width: parent.width
+                                                spacing: 2
+                                                Row {
+                                                    width: parent.width
+                                                    spacing: 14
+                                                    Text {
+                                                        id: nlRowTitle
+                                                        width: Math.min(implicitWidth, parent.width - nlRowPage.implicitWidth - 14)
+                                                        elide: Text.ElideRight
+                                                        text: modelData.title
+                                                        font.family: root.nlSerif
+                                                        font.pixelSize: 38
+                                                        color: "black"
+                                                    }
+                                                    Text {
+                                                        id: nlRowPage
+                                                        anchors.baseline: nlRowTitle.baseline
+                                                        text: modelData.page
+                                                        font.family: root.nlSerif
+                                                        font.italic: true
+                                                        font.pixelSize: 30
+                                                        color: "black"
+                                                    }
+                                                }
+                                                Text {
+                                                    visible: { return modelData.quote !== ""; }
+                                                    width: parent.width
+                                                    elide: Text.ElideRight
+                                                    text: "“" + modelData.quote + "”"
+                                                    font.family: root.nlSerif
+                                                    font.italic: true
+                                                    font.pixelSize: 28
+                                                    color: "black"
+                                                }
+                                            }
+                                            Rectangle {
+                                                anchors.bottom: parent.bottom
+                                                width: parent.width
+                                                height: 1
+                                                color: "black"
+                                            }
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                onClicked: root.nlGoTo(modelData.docId, modelData.pageId, modelData.pageNo, true)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ---- Tags tab ----
+                            Text {
+                                visible: root.nlPanelTab === "tags" && root.nlTagIndex.length === 0
+                                topPadding: 28
+                                width: parent.width
+                                wrapMode: Text.WordWrap
+                                text: "No spot tags yet. Lasso some writing and tap Tag."
+                                font.family: root.nlSerif
+                                font.italic: true
+                                font.pixelSize: 30
+                                color: "#555555"
+                            }
+                            Repeater {
+                                model: root.nlPanelTab === "tags" ? root.nlTagIndex : []
+                                delegate: Column {
+                                    id: nlTagGroup
+                                    required property var modelData
+                                    width: nlPanelCol.width
+                                    readonly property bool open: root.nlOpenTag === modelData.tag
+                                    Item {
+                                        width: parent.width
+                                        height: 100
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: "#" + nlTagGroup.modelData.tag
+                                            font.family: root.nlSerif
+                                            font.italic: true
+                                            font.pixelSize: 42
+                                            color: "black"
+                                        }
+                                        Text {
+                                            anchors.right: parent.right
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: nlTagGroup.modelData.hits.length + (nlTagGroup.modelData.hits.length === 1 ? " spot" : " spots")
+                                            font.family: root.nlSerif
+                                            font.pixelSize: 30
+                                            color: "black"
+                                        }
+                                        Rectangle {
+                                            anchors.bottom: parent.bottom
+                                            width: parent.width
+                                            height: 1
+                                            color: "black"
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked: root.nlOpenTag = nlTagGroup.open ? "" : nlTagGroup.modelData.tag
+                                        }
+                                    }
+                                    Repeater {
+                                        model: nlTagGroup.open ? nlTagGroup.modelData.hits : []
+                                        delegate: Item {
+                                            required property var modelData
+                                            width: nlTagGroup.width
+                                            height: 84
+                                            Row {
+                                                x: 40
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                spacing: 14
+                                                Text {
+                                                    id: nlHitTitle
+                                                    width: Math.min(implicitWidth, nlTagGroup.width - 200)
+                                                    elide: Text.ElideRight
+                                                    text: root.nlDocName(modelData.docId, modelData.docName)
+                                                    font.family: root.nlSerif
+                                                    font.pixelSize: 34
+                                                    color: "black"
+                                                }
+                                                Text {
+                                                    anchors.baseline: nlHitTitle.baseline
+                                                    text: modelData.tag.pageNo > 0 ? "p. " + modelData.tag.pageNo : ""
+                                                    font.family: root.nlSerif
+                                                    font.italic: true
+                                                    font.pixelSize: 28
+                                                    color: "black"
+                                                }
+                                            }
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                onClicked: root.nlGoTo(modelData.docId, modelData.tag.pageId, modelData.tag.pageNo, true)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT
+
+; ---------------------------------------------------------------------------
+; Home sidebar (hamburger menu): "Links graph" entry and a full-screen graph
+; of every notebook linked with noteLinks. Reads the local index only.
+; ---------------------------------------------------------------------------
+AFFECT [[4911547370760691430]]
+    TRAVERSE [[8397993708429497603]]
+        LOCATE AFTER ALL
+        INSERT {
+            // ================= noteLinks: graph =================
+            Item {
+                id: nlGraph
+                parent: root.parent
+                anchors.fill: parent
+                z: 900
+                visible: false
+
+                readonly property string nlIndexUrl: "file:///home/root/.local/share/notelinks/index.json"
+                readonly property string nlSerif: "EB Garamond"
+                property var nodes: []
+                property var edges: []
+                property bool showTags: true
+                property var index: null
+                property int selected: -1
+                property string status: ""
+                property int linkCount: 0
+                property int tagCount: 0
+
+                function openGraph() {
+                    nlGraph.selected = -1;
+                    nlGraph.status = "Reading links…";
+                    nlGraph.nodes = [];
+                    nlGraph.edges = [];
+                    nlGraph.visible = true;
+                    const xhr = new XMLHttpRequest();
+                    xhr.onreadystatechange = function () {
+                        if (xhr.readyState !== XMLHttpRequest.DONE) return;
+                        let idx = null;
+                        try {
+                            idx = JSON.parse(xhr.responseText);
+                        } catch (e) {
+                            idx = null;
+                        }
+                        nlGraph.index = (idx && idx.docs) ? idx : { v: 1, docs: {} };
+                        nlGraph.build();
+                    };
+                    try {
+                        xhr.open("GET", nlGraph.nlIndexUrl);
+                        xhr.send();
+                    } catch (e) {
+                        nlGraph.index = { v: 1, docs: {} };
+                        nlGraph.build();
+                    }
+                }
+
+                function closeGraph() {
+                    nlGraph.visible = false;
+                    nlGraph.selected = -1;
+                }
+
+                function entryFor(docId) {
+                    try {
+                        return Library.entryForId(docId);
+                    } catch (e) {
+                        return null;
+                    }
+                }
+
+                function docName(docId, fallback) {
+                    const e = entryFor(docId);
+                    if (e && e.visibleName) return String(e.visibleName);
+                    return fallback || "Untitled";
+                }
+
+                function build() {
+                    const docs = nlGraph.index.docs;
+                    const nodes = [];
+                    const byKey = ({});
+                    const edgeMap = ({});
+                    let links = 0;
+                    let tags = 0;
+                    const node = (key, kind, name, docId) => {
+                        if (byKey[key] === undefined) {
+                            byKey[key] = nodes.length;
+                            nodes.push({ key: key, kind: kind, name: name, docId: docId, deg: 0, x: 0, y: 0, out: [], inn: [], spots: [] });
+                        }
+                        return byKey[key];
+                    };
+                    const edge = (a, b, kind) => {
+                        if (a === b) return;
+                        const k = a < b ? a + "-" + b : b + "-" + a;
+                        if (!edgeMap[k]) edgeMap[k] = { a: a, b: b, w: 0, kind: kind };
+                        edgeMap[k].w++;
+                        nodes[a].deg++;
+                        nodes[b].deg++;
+                    };
+                    for (const id in docs) {
+                        const d = docs[id];
+                        const hasAny = (d.links && d.links.length) || (nlGraph.showTags && d.tags && d.tags.length);
+                        if (!hasAny) continue;
+                        node("d:" + id, "doc", docName(id, d.name), id);
+                    }
+                    for (const id in docs) {
+                        const d = docs[id];
+                        for (const l of (d.links || [])) {
+                            if (!l.targetDoc) continue;
+                            links++;
+                            const a = node("d:" + id, "doc", docName(id, d.name), id);
+                            const b = node("d:" + l.targetDoc, "doc", docName(l.targetDoc, l.targetName), l.targetDoc);
+                            nodes[a].out.push({ docId: l.targetDoc, pageNo: l.targetPageNo || 0, label: l.label || "", name: nodes[b].name });
+                            nodes[b].inn.push({ docId: id, pageNo: l.pageNo || 0, label: l.label || "", name: nodes[a].name });
+                            edge(a, b, "link");
+                        }
+                        if (!nlGraph.showTags) continue;
+                        for (const t of (d.tags || [])) {
+                            if (!t.tag) continue;
+                            tags++;
+                            const a = node("d:" + id, "doc", docName(id, d.name), id);
+                            const b = node("t:" + t.tag, "tag", t.tag, "");
+                            nodes[b].spots.push({ docId: id, pageNo: t.pageNo || 0, name: nodes[a].name });
+                            edge(a, b, "tag");
+                        }
+                    }
+                    const edges = Object.keys(edgeMap).map(k => edgeMap[k]);
+                    nlGraph.layout(nodes, edges);
+                    nlGraph.linkCount = links;
+                    nlGraph.tagCount = tags;
+                    nlGraph.edges = edges;
+                    nlGraph.nodes = nodes;
+                    nlGraph.status = nodes.length === 0 ? "No links yet. In a notebook, lasso some writing and tap Link." : "";
+                    nlEdges.requestPaint();
+                }
+
+                // Deterministic force layout (Fruchterman-Reingold), fitted to the canvas.
+                function layout(nodes, edges) {
+                    const n = nodes.length;
+                    if (n === 0) return;
+                    const W = 1000;
+                    const H = 1000;
+                    const k = Math.sqrt((W * H) / n) * 0.75;
+                    for (let i = 0; i < n; i++) {
+                        const a = (2 * Math.PI * i) / n;
+                        const r = 300 + 40 * (i % 3);
+                        nodes[i].x = W / 2 + r * Math.cos(a);
+                        nodes[i].y = H / 2 + r * Math.sin(a);
+                    }
+                    let temp = W / 8;
+                    for (let it = 0; it < 300; it++) {
+                        const dx = new Array(n).fill(0);
+                        const dy = new Array(n).fill(0);
+                        for (let i = 0; i < n; i++) {
+                            for (let j = i + 1; j < n; j++) {
+                                let vx = nodes[i].x - nodes[j].x;
+                                let vy = nodes[i].y - nodes[j].y;
+                                let d = Math.sqrt(vx * vx + vy * vy);
+                                if (d < 0.01) {
+                                    vx = 0.01 * (i + 1);
+                                    vy = 0.01 * (j + 1);
+                                    d = 0.02;
+                                }
+                                const f = (k * k) / d;
+                                dx[i] += (vx / d) * f;
+                                dy[i] += (vy / d) * f;
+                                dx[j] -= (vx / d) * f;
+                                dy[j] -= (vy / d) * f;
+                            }
+                        }
+                        for (const e of edges) {
+                            const vx = nodes[e.a].x - nodes[e.b].x;
+                            const vy = nodes[e.a].y - nodes[e.b].y;
+                            const d = Math.max(0.01, Math.sqrt(vx * vx + vy * vy));
+                            const f = (d * d) / k * (e.kind === "tag" ? 0.6 : 1);
+                            dx[e.a] -= (vx / d) * f;
+                            dy[e.a] -= (vy / d) * f;
+                            dx[e.b] += (vx / d) * f;
+                            dy[e.b] += (vy / d) * f;
+                        }
+                        for (let i = 0; i < n; i++) {
+                            dx[i] += (W / 2 - nodes[i].x) * 0.02 * k / 10;
+                            dy[i] += (H / 2 - nodes[i].y) * 0.02 * k / 10;
+                            const d = Math.max(0.01, Math.sqrt(dx[i] * dx[i] + dy[i] * dy[i]));
+                            nodes[i].x += (dx[i] / d) * Math.min(d, temp);
+                            nodes[i].y += (dy[i] / d) * Math.min(d, temp);
+                        }
+                        temp = Math.max(1, temp * 0.985);
+                    }
+                    let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+                    for (const p of nodes) {
+                        minX = Math.min(minX, p.x);
+                        minY = Math.min(minY, p.y);
+                        maxX = Math.max(maxX, p.x);
+                        maxY = Math.max(maxY, p.y);
+                    }
+                    const spanX = Math.max(1, maxX - minX);
+                    const spanY = Math.max(1, maxY - minY);
+                    for (const p of nodes) {
+                        p.x = n === 1 ? 0.5 : (p.x - minX) / spanX;
+                        p.y = n === 1 ? 0.5 : (p.y - minY) / spanY;
+                    }
+                }
+
+                function isNeighbour(i) {
+                    const s = nlGraph.selected;
+                    if (s < 0 || i === s) return true;
+                    for (const e of nlGraph.edges) {
+                        if ((e.a === s && e.b === i) || (e.b === s && e.a === i)) return true;
+                    }
+                    return false;
+                }
+
+                function openDoc(docId, pageNo) {
+                    const e = entryFor(docId);
+                    if (!e) {
+                        nlGraph.status = "That notebook was deleted.";
+                        return;
+                    }
+                    if (e.archived) {
+                        nlGraph.status = "Download “" + e.visibleName + "” to this tablet first.";
+                        return;
+                    }
+                    nlGraph.closeGraph();
+                    const args = ({});
+                    args.documentId = docId;
+                    args.openedFrom = "noteLinks graph";
+                    if (pageNo > 0) args.page = pageNo - 1;
+                    root.windowNavigator.open("legacydevice/window/main", args);
+                }
+
+                function cardRows() {
+                    const s = nlGraph.selected;
+                    if (s < 0 || s >= nlGraph.nodes.length) return [];
+                    const n = nlGraph.nodes[s];
+                    const rows = [];
+                    if (n.kind === "tag") {
+                        for (const x of n.spots) rows.push({ arrow: "#", name: x.name, page: x.pageNo, label: "", docId: x.docId });
+                        return rows;
+                    }
+                    for (const x of n.out) rows.push({ arrow: "→", name: x.name, page: x.pageNo, label: x.label, docId: x.docId });
+                    for (const x of n.inn) rows.push({ arrow: "←", name: x.name, page: x.pageNo, label: x.label, docId: x.docId });
+                    return rows;
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: nlGraph.selected = -1
+                }
+
+                Rectangle {
+                    anchors.fill: parent
+                    color: "white"
+                }
+
+                // ---- header ----
+                Item {
+                    id: nlGraphHead
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.margins: 72
+                    height: 220
+
+                    Text {
+                        id: nlGraphKicker
+                        text: "NOTELINKS"
+                        font.family: nlGraph.nlSerif
+                        font.pixelSize: 24
+                        font.letterSpacing: 8
+                        color: "black"
+                    }
+                    Text {
+                        id: nlGraphTitle
+                        anchors.top: nlGraphKicker.bottom
+                        anchors.topMargin: 8
+                        text: "Links graph"
+                        font.family: nlGraph.nlSerif
+                        font.pixelSize: 76
+                        color: "black"
+                    }
+                    Text {
+                        anchors.top: nlGraphTitle.bottom
+                        anchors.topMargin: 4
+                        text: {
+                            const n = nlGraph.nodes.filter(x => x.kind === "doc").length;
+                            let s = n + (n === 1 ? " notebook · " : " notebooks · ") + nlGraph.linkCount + (nlGraph.linkCount === 1 ? " link" : " links");
+                            if (nlGraph.showTags) s += " · " + nlGraph.tagCount + (nlGraph.tagCount === 1 ? " tag spot" : " tag spots");
+                            return s;
+                        }
+                        font.family: nlGraph.nlSerif
+                        font.italic: true
+                        font.pixelSize: 32
+                        color: "black"
+                    }
+
+                    Row {
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        spacing: 20
+                        Rectangle {
+                            width: 190
+                            height: 76
+                            radius: 38
+                            color: nlGraph.showTags ? "black" : "white"
+                            border.color: "black"
+                            border.width: 3
+                            Text {
+                                anchors.centerIn: parent
+                                text: "# Tags"
+                                font.family: nlGraph.nlSerif
+                                font.pixelSize: 32
+                                color: nlGraph.showTags ? "white" : "black"
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    nlGraph.showTags = !nlGraph.showTags;
+                                    nlGraph.selected = -1;
+                                    nlGraph.build();
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: 170
+                            height: 76
+                            radius: 38
+                            color: "white"
+                            border.color: "black"
+                            border.width: 3
+                            Text {
+                                anchors.centerIn: parent
+                                text: "Close"
+                                font.family: nlGraph.nlSerif
+                                font.italic: true
+                                font.pixelSize: 32
+                                color: "black"
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: nlGraph.closeGraph()
+                            }
+                        }
+                    }
+                    Rectangle {
+                        anchors.bottom: parent.bottom
+                        width: parent.width
+                        height: 2
+                        color: "black"
+                    }
+                }
+
+                Text {
+                    visible: nlGraph.status.length > 0
+                    anchors.top: nlGraphHead.bottom
+                    anchors.topMargin: 40
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.leftMargin: 72
+                    anchors.rightMargin: 72
+                    wrapMode: Text.WordWrap
+                    text: nlGraph.status
+                    font.family: nlGraph.nlSerif
+                    font.italic: true
+                    font.pixelSize: 36
+                    color: "black"
+                    z: 5
+                }
+
+                // ---- graph area ----
+                Item {
+                    id: nlGraphArea
+                    anchors.top: nlGraphHead.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.leftMargin: 200
+                    anchors.rightMargin: 200
+                    anchors.topMargin: 150
+                    anchors.bottomMargin: nlGraph.selected >= 0 ? 830 : 200
+
+                    function px(i) {
+                        return nlGraph.nodes[i].x * width;
+                    }
+                    function py(i) {
+                        return nlGraph.nodes[i].y * height;
+                    }
+                    onWidthChanged: nlEdges.requestPaint()
+                    onHeightChanged: nlEdges.requestPaint()
+
+                    Canvas {
+                        id: nlEdges
+                        anchors.fill: parent
+                        anchors.margins: -200
+                        onPaint: {
+                            const c = getContext("2d");
+                            c.reset();
+                            c.translate(200, 200);
+                            const s = nlGraph.selected;
+                            for (const e of nlGraph.edges) {
+                                if (e.a >= nlGraph.nodes.length || e.b >= nlGraph.nodes.length) continue;
+                                const hot = s >= 0 && (e.a === s || e.b === s);
+                                const dim = s >= 0 && !hot;
+                                c.strokeStyle = dim ? "#555555" : "black";
+                                c.lineWidth = e.kind === "tag" ? (hot ? 3 : 1.5) : Math.min(8, (hot ? 4 : 2.5) + e.w);
+                                if (e.kind === "tag") c.setLineDash([6, 8]);
+                                else c.setLineDash([]);
+                                c.beginPath();
+                                c.moveTo(nlGraphArea.px(e.a), nlGraphArea.py(e.a));
+                                c.lineTo(nlGraphArea.px(e.b), nlGraphArea.py(e.b));
+                                c.stroke();
+                            }
+                        }
+                    }
+
+                    Repeater {
+                        model: nlGraph.nodes
+                        delegate: Item {
+                            id: nlNode
+                            required property var modelData
+                            required property int index
+                            readonly property bool isDoc: modelData.kind === "doc"
+                            readonly property bool isSel: nlGraph.selected === index
+                            readonly property bool near: nlGraph.isNeighbour(index)
+                            readonly property real dot: isDoc ? Math.min(64, 30 + modelData.deg * 6) : 22
+                            x: modelData.x * nlGraphArea.width - width / 2
+                            y: modelData.y * nlGraphArea.height - dot / 2
+                            width: Math.max(dot, nlNodeLabel.width) + 24
+                            height: dot + nlNodeLabel.height + 12
+                            z: isSel ? 3 : 1
+
+                            Rectangle {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                width: nlNode.dot
+                                height: nlNode.dot
+                                radius: nlNode.dot / 2
+                                color: {
+                                    if (nlNode.isSel) return "white";
+                                    if (nlNode.isDoc === false) return "white";
+                                    return nlNode.near ? "black" : "#555555";
+                                }
+                                border.color: nlNode.near ? "black" : "#555555"
+                                border.width: nlNode.isSel ? 8 : 3
+                            }
+                            Rectangle {
+                                anchors.fill: nlNodeLabel
+                                anchors.margins: -6
+                                color: "white"
+                                radius: 8
+                            }
+                            Text {
+                                id: nlNodeLabel
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                y: nlNode.dot + 6
+                                width: Math.min(implicitWidth, 380)
+                                elide: Text.ElideRight
+                                horizontalAlignment: Text.AlignHCenter
+                                text: nlNode.isDoc ? nlNode.modelData.name : "#" + nlNode.modelData.name
+                                font.family: nlGraph.nlSerif
+                                font.italic: nlNode.isDoc === false
+                                font.pixelSize: nlNode.isDoc ? 36 : 30
+                                font.bold: nlNode.isSel
+                                color: nlNode.near ? "black" : "#555555"
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -16
+                                onClicked: {
+                                    nlGraph.selected = nlNode.isSel ? -1 : nlNode.index;
+                                    nlEdges.requestPaint();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- selection card ----
+                Rectangle {
+                    id: nlGraphCard
+                    visible: nlGraph.selected >= 0 && nlGraph.selected < nlGraph.nodes.length
+                    readonly property var node: visible ? nlGraph.nodes[nlGraph.selected] : null
+                    readonly property var rows: visible ? nlGraph.cardRows() : []
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.margins: 48
+                    height: 680
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    radius: 24
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Text {
+                        id: nlCardKicker
+                        x: 48
+                        y: 40
+                        text: { return (nlGraphCard.node && nlGraphCard.node.kind === "tag") ? "TAG · " + nlGraphCard.rows.length + " SPOTS" : "NOTEBOOK"; }
+                        font.family: nlGraph.nlSerif
+                        font.pixelSize: 22
+                        font.letterSpacing: 6
+                        color: "black"
+                    }
+                    Text {
+                        id: nlCardTitle
+                        x: 48
+                        anchors.top: nlCardKicker.bottom
+                        anchors.topMargin: 6
+                        width: parent.width - 96 - nlCardOpen.width
+                        elide: Text.ElideRight
+                        text: nlGraphCard.node ? (nlGraphCard.node.kind === "tag" ? "#" + nlGraphCard.node.name : nlGraphCard.node.name) : ""
+                        font.family: nlGraph.nlSerif
+                        font.italic: nlGraphCard.node ? nlGraphCard.node.kind === "tag" : false
+                        font.pixelSize: 56
+                        color: "black"
+                    }
+                    Rectangle {
+                        id: nlCardOpen
+                        visible: nlGraphCard.node ? nlGraphCard.node.kind === "doc" : false
+                        anchors.right: parent.right
+                        anchors.rightMargin: 48
+                        y: 48
+                        width: 300
+                        height: 80
+                        radius: 40
+                        color: "black"
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Open notebook"
+                            font.family: nlGraph.nlSerif
+                            font.pixelSize: 32
+                            color: "white"
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: nlGraph.openDoc(nlGraphCard.node.docId, 0)
+                        }
+                    }
+                    Rectangle {
+                        id: nlCardRule
+                        x: 48
+                        anchors.top: nlCardTitle.bottom
+                        anchors.topMargin: 16
+                        width: parent.width - 96
+                        height: 2
+                        color: "black"
+                    }
+                    ListView {
+                        anchors.top: nlCardRule.bottom
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: 24
+                        x: 48
+                        width: parent.width - 96
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        model: nlGraphCard.rows
+                        delegate: Item {
+                            required property var modelData
+                            width: ListView.view.width
+                            height: 96
+                            Text {
+                                id: nlRowArrow
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 56
+                                text: modelData.arrow
+                                font.family: nlGraph.nlSerif
+                                font.pixelSize: 40
+                                color: "black"
+                            }
+                            Column {
+                                anchors.left: nlRowArrow.right
+                                anchors.right: nlRowGo.left
+                                anchors.rightMargin: 16
+                                anchors.verticalCenter: parent.verticalCenter
+                                Text {
+                                    width: parent.width
+                                    elide: Text.ElideRight
+                                    text: modelData.name + (modelData.page > 0 ? ", p. " + modelData.page : "")
+                                    font.family: nlGraph.nlSerif
+                                    font.pixelSize: 36
+                                    color: "black"
+                                }
+                                Text {
+                                    visible: modelData.label.length > 0
+                                    width: parent.width
+                                    elide: Text.ElideRight
+                                    text: "“" + modelData.label + "”"
+                                    font.family: nlGraph.nlSerif
+                                    font.italic: true
+                                    font.pixelSize: 28
+                                    color: "black"
+                                }
+                            }
+                            Text {
+                                id: nlRowGo
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "Open"
+                                font.family: nlGraph.nlSerif
+                                font.italic: true
+                                font.pixelSize: 32
+                                font.underline: true
+                                color: "black"
+                            }
+                            Rectangle {
+                                anchors.bottom: parent.bottom
+                                width: parent.width
+                                height: 1
+                                color: "black"
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: nlGraph.openDoc(modelData.docId, modelData.page)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        TRAVERSE [[14125623155555875541]]#[[15885405667098360701]]
+            LOCATE AFTER [[425121728314878811.452264033555071090]]#[[8399470819241482942]]
+            INSERT {
+                ArkControls.SidebarItem {
+                    id: nlGraphItem
+                    objectName: "nlGraphItem"
+                    text: "Links graph"
+                    iconSource: "qrc:/ark/icons/link"
+                    highlighted: false
+                    onClicked: {
+                        root.toggle();
+                        nlGraph.openGraph();
+                    }
+                    Layout.preferredHeight: Common.Values.navigatorSidebarItemHeight
+                    Layout.preferredWidth: parent.width
+                }
+            }
+        END TRAVERSE
+    END TRAVERSE
+END AFFECT

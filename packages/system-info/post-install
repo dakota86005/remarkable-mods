@@ -1,0 +1,12 @@
+#!/bin/sh
+D=/home/root/.local/share/sysinfo
+mkdir -p "$D"
+BATT=""
+for d in /sys/class/power_supply/*; do
+	[ -f "$d/type" ] || continue
+	if [ "$(cat "$d/type")" = "Battery" ]; then BATT="$d"; break; fi
+done
+[ -n "$BATT" ] && printf '{"battery":"%s"}\n' "$BATT" > "$D/paths.json"
+[ -f "$D/settings.json" ] || echo '{"logging":false,"logMinutes":5,"refreshSec":5}' > "$D/settings.json"
+@RESTART@
+exit 0

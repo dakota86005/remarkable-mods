@@ -1,0 +1,4 @@
+{"pkgname": "nave", "pkgver": "3.1.0", "pkgrel": 0,
+ "pkgdesc": "Two-column home screen for My files: folder aisle, Continue, progress bars and a random watercolor plate.",
+ "license": "custom", "url": "https://github.com/dakota86005/remarkable-mods",
+ "depends": ["qt-resource-rebuilder", "!rm1", "!rm2", "remarkable-os>=3.29", "remarkable-os<3.30"]}

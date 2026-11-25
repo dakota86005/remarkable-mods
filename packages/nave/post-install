@@ -1,0 +1,13 @@
+#!/bin/sh
+HS=/home/root/.local/share/homescreen
+QRR=/home/root/xovi/exthome/qt-resource-rebuilder
+chmod +x "$HS/refresh-plates.sh"
+sh "$HS/refresh-plates.sh" >/dev/null 2>&1 || true
+[ -f "$HS/progress.json" ] || echo '{}' > "$HS/progress.json"
+if [ -f "$QRR/homeCards.qmd" ]; then
+	mkdir -p "$HS/disabled"
+	mv "$QRR/homeCards.qmd" "$HS/disabled/homeCards.qmd"
+	echo "nave: moved homeCards.qmd to $HS/disabled/ (Nave replaces it)"
+fi
+@RESTART@
+exit 0

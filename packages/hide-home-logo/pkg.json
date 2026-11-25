@@ -1,0 +1,4 @@
+{"pkgname": "hide-home-logo", "pkgver": "2.0.0", "pkgrel": 0,
+ "pkgdesc": "Hides the reMarkable wordmark in the home screen header. Tapping the spot still opens My files.",
+ "license": "custom", "url": "https://github.com/dakota86005/remarkable-mods",
+ "depends": ["qt-resource-rebuilder", "!rm1", "!rm2", "remarkable-os>=3.29", "remarkable-os<3.30"]}
