@@ -1,9 +1,13 @@
 /*
- * Sudoku helper for AppLoad: tells the app which end of the Marker is near the screen.
+ * Sudoku helper for AppLoad: tells the app what the Marker is doing.
  *
- * The tablet hands the Marker to apps as a plain mouse, so the app cannot tell the eraser end
- * from the tip. This program only watches the Marker's own input device for the "eraser in
- * range" key and passes that single bit on. It never grabs the device and never writes to it.
+ * The tablet hands the Marker to apps as a plain mouse (no eraser end, and no events at all
+ * while the tablet's own ink engine is drawing). This program watches the Marker's input
+ * device and reports which end is near the screen, where the Marker lands, and the path of
+ * each stroke once it lifts. It never grabs the device and never writes to it.
+ *
+ * Positions are sent as fractions of the digitizer range times 65535, which is how the tablet
+ * itself places the pen: screen x = ABS_X / max * width (same for y).
  *
  * AppLoad protocol: argv[1] is a SOCK_SEQPACKET unix socket. A message is an 8 byte header
  * (int32 type, int32 length) followed, when length > 0, by a second packet with the text.
@@ -24,6 +28,9 @@
 
 #define MSG_ERASER 1      /* "1" eraser end in range, "0" not */
 #define MSG_STATUS 2      /* text for the app's diagnostics line */
+#define MSG_STROKE 3      /* "e;x,y,x,y,..." a finished stroke; e is 1 for the eraser end */
+#define MSG_DOWN 4        /* "x,y" the Marker has just touched the screen */
+#define MAX_POINTS 5000
 #define SYS_TERMINATE (-1)
 #define SYS_NEW_FRONTEND (-2)
 
@@ -61,6 +68,42 @@ static int open_marker(char *name, size_t len) {
     return -1;
 }
 
+static int max_x = 0, max_y = 0;
+static int px[MAX_POINTS], py[MAX_POINTS], np = 0;
+
+static void read_ranges(int fd) {
+    struct input_absinfo a;
+    max_x = max_y = 0;
+    if (ioctl(fd, EVIOCGABS(ABS_X), &a) >= 0) max_x = a.maximum;
+    if (ioctl(fd, EVIOCGABS(ABS_Y), &a) >= 0) max_y = a.maximum;
+    if (getenv("SUDOKU_TEST_DEVICE")) { max_x = 20000; max_y = 30000; }     /* desk test only */
+}
+static int norm(int v, int max) {
+    if (max <= 0) return 0;
+    if (v < 0) v = 0;
+    if (v > max) v = max;
+    return (int) (((long long) v * 65535 + max / 2) / max);
+}
+static void add_point(int x, int y) {
+    if (np > 0) {
+        int dx = x - px[np - 1], dy = y - py[np - 1];
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        if (dx + dy < 12) return;          /* under a third of a pixel */
+    }
+    if (np == MAX_POINTS) {                /* a very long stroke: keep every other point */
+        for (int i = 0; i < MAX_POINTS / 2; i++) { px[i] = px[2 * i]; py[i] = py[2 * i]; }
+        np = MAX_POINTS / 2;
+    }
+    px[np] = x; py[np] = y; np++;
+}
+static void send_stroke(int eraser) {
+    static char text[MAX_POINTS * 12 + 16];
+    int n = snprintf(text, sizeof text, "%d;", eraser ? 1 : 0);
+    for (int i = 0; i < np; i++) n += snprintf(text + n, sizeof text - (size_t) n, i ? ",%d,%d" : "%d,%d", px[i], py[i]);
+    say(MSG_STROKE, text);
+}
+
 static int rubber_now(int fd) {
     unsigned long keys[(KEY_MAX / (8 * sizeof(long))) + 1];
     memset(keys, 0, sizeof keys);
@@ -70,8 +113,9 @@ static int rubber_now(int fd) {
 
 int main(int argc, char **argv) {
     struct sockaddr_un addr;
-    char name[32] = "";
+    char name[96] = "";
     int dev = -1, rubber = 0, idle = 0;
+    int ax = 0, ay = 0, have = 0, touch = 0, was = 0, stroke_rubber = 0;
 
     signal(SIGPIPE, SIG_IGN);
     if (argc < 2) return 0;
@@ -89,7 +133,13 @@ int main(int argc, char **argv) {
         struct pollfd p[2];
         if (dev < 0 && idle <= 0) {
             dev = open_marker(name, sizeof name);
-            if (dev >= 0) { rubber = rubber_now(dev); say(MSG_STATUS, name); say(MSG_ERASER, rubber ? "1" : "0"); }
+            if (dev >= 0) {
+                char st[96];
+                read_ranges(dev); rubber = rubber_now(dev); touch = was = 0; np = 0; have = 0;
+                snprintf(st, sizeof st, "%s %dx%d", name, max_x, max_y);
+                snprintf(name, sizeof name, "%s", st);
+                say(MSG_STATUS, name); say(MSG_ERASER, rubber ? "1" : "0");
+            }
             else { say(MSG_STATUS, "no Marker device"); idle = 5; }
         }
         p[0].fd = sock; p[0].events = POLLIN; p[0].revents = 0;
@@ -108,6 +158,7 @@ int main(int argc, char **argv) {
             if (head[0] == SYS_TERMINATE) return 0;
             if (head[0] == SYS_NEW_FRONTEND) {
                 /* The app has just opened: tell it where things stand. */
+                np = 0; was = 0;
                 say(MSG_STATUS, dev >= 0 ? name : "no Marker device");
                 say(MSG_ERASER, rubber ? "1" : "0");
             }
@@ -127,13 +178,38 @@ int main(int argc, char **argv) {
                 if (rubber) { rubber = 0; say(MSG_ERASER, "0"); }
                 continue;
             }
-            int now = rubber;
             for (size_t i = 0; i < (size_t) got / sizeof ev[0]; i++) {
-                if (ev[i].type == EV_KEY && ev[i].code == BTN_TOOL_RUBBER) now = ev[i].value ? 1 : 0;
-                else if (ev[i].type == EV_SYN && ev[i].code == SYN_DROPPED) now = -1;
+                int type = ev[i].type, code = ev[i].code, value = ev[i].value;
+                if (type == EV_ABS) {
+                    if (code == ABS_X) { ax = value; have |= 1; }
+                    else if (code == ABS_Y) { ay = value; have |= 2; }
+                } else if (type == EV_KEY) {
+                    if (code == BTN_TOOL_RUBBER) {
+                        int now = value ? 1 : 0;
+                        if (now != rubber) { rubber = now; say(MSG_ERASER, rubber ? "1" : "0"); }
+                    } else if (code == BTN_TOUCH) touch = value ? 1 : 0;
+                } else if (type == EV_SYN && code == SYN_DROPPED) {
+                    /* Events were lost: drop the stroke in progress rather than guess. */
+                    int now = rubber_now(dev);
+                    if (now != rubber) { rubber = now; say(MSG_ERASER, rubber ? "1" : "0"); }
+                    touch = was = 0; np = 0;
+                } else if (type == EV_SYN && code == SYN_REPORT) {
+                    if (touch && have == 3) {
+                        int x = norm(ax, max_x), y = norm(ay, max_y);
+                        if (!was) {
+                            char at[32];
+                            np = 0; stroke_rubber = rubber; was = 1;
+                            snprintf(at, sizeof at, "%d,%d", x, y);
+                            say(MSG_DOWN, at);
+                        }
+                        add_point(x, y);
+                    } else if (!touch && was) {
+                        was = 0;
+                        if (np > 0) send_stroke(stroke_rubber);
+                        np = 0;
+                    }
+                }
             }
-            if (now < 0) now = rubber_now(dev);
-            if (now != rubber) { rubber = now; say(MSG_ERASER, rubber ? "1" : "0"); }
         }
     }
 }
