@@ -1,0 +1,4 @@
+#!/bin/sh
+mkdir -p /home/root/.local/share/upnext
+@RESTART@
+exit 0

@@ -1,0 +1,1174 @@
+; Up Next - v1.0
+; A quiet "up next" line in the home screen header, to the right of Field Weather:
+; the next event from your calendar's .ics link, with the date beside it.
+;   Tap it -> its menu: coming up, when to show it, how far to look, calendars.
+; Works offline from a saved copy (cache.json); refreshes on Wi-Fi, on wake and hourly.
+; Calendars: add the .ics (or webcal://) link in the menu, or append links, one per
+;   line, to /home/root/.local/share/upnext/links.txt (read and emptied on the next start
+;   or menu open).
+; Files: /home/root/.local/share/upnext/ (ical.js reader, settings.json, cache.json)
+; The .ics feed is parsed in a WorkerScript thread, so a big calendar never stalls the pen.
+; qmldiff note: binding values never start with "(" or contain "!"; checked with qmd_lint.py.
+; Target firmware: 3.29.1.0 (hashtab 3.29.1.0)
+; Logs: journalctl -u xochitl --since "-15min" | grep upNext
+; Remove: delete this file from /home/root/xovi/exthome/qt-resource-rebuilder/ and restart xovi.
+
+; /qml/device/view/navigator/ContentHeader.qml
+AFFECT [[16664384747789373392]]
+    ; FocusScope#header
+    TRAVERSE ?#[[7082729395218]]
+
+        LOCATE AFTER ALL INSERT {
+            Item {
+                id: upNext
+                anchors.fill: parent
+
+                readonly property string dir: "file:///home/root/.local/share/upnext/"
+                readonly property string serif: "EB Garamond"
+                readonly property real day: 86400000
+
+                // settings (settings.json)
+                property var urls: []
+                property bool weekdaysOnly: false
+                property int lookDays: 7
+                property bool showAllDay: true
+
+                // saved copy (cache.json): url -> { at, name, events, total, err, errAt }
+                property var byUrl: { return {}; }
+                property var events: []
+                property bool loaded: false
+
+                // what the header shows
+                property real now: 0
+                property string tileDay: ""
+                property string tileDate: ""
+                property string line1: "Up next"
+                property string line2: ""
+                property bool shown: true
+                property var coming: []
+
+                // menu
+                property bool menuOpen: false
+                property string removeArm: ""
+                property string status: ""
+
+                // fetching
+                property bool busy: false
+                property var queue: []
+                property var pending: null
+                property int reqSeq: 0
+                property real lastFetch: 0
+                property var worker: null
+                property var parseFn: null
+
+                function log(msg) {
+                    console.log("[upNext] " + msg);
+                }
+
+                function hostOf(u) {
+                    var m = new RegExp("^[a-z]+://([^/?#]+)", "i").exec(u || "");
+                    return m ? m[1] : "calendar";
+                }
+
+                // ---------- time words
+
+                function midnight(t) {
+                    var d = new Date(t);
+                    return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+                }
+
+                function clockParts(t) {
+                    var d = new Date(t);
+                    var h = d.getHours();
+                    var m = d.getMinutes();
+                    var txt = (h % 12 || 12) + (m ? ":" + ("0" + m).slice(-2) : "");
+                    return { txt: txt, ap: h < 12 ? "am" : "pm" };
+                }
+
+                function clock(t) {
+                    var c = clockParts(t);
+                    return c.txt + " " + c.ap;
+                }
+
+                function span(s, e) {
+                    var a = clockParts(s), b = clockParts(e);
+                    if (e - s < 60000) return a.txt + " " + a.ap;
+                    if (a.ap === b.ap && e - s < 12 * 3600000) return a.txt + " – " + b.txt + " " + b.ap;
+                    return a.txt + " " + a.ap + " – " + b.txt + " " + b.ap;
+                }
+
+                readonly property var dayNames: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+                readonly property var monthNames: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+                function dayWord(t) {
+                    var d0 = midnight(now);
+                    var dd = Math.round((midnight(t) - d0) / day);
+                    var d = new Date(t);
+                    if (dd === 0) return "Today";
+                    if (dd === 1) return "Tomorrow";
+                    if (dd > 1 && dd < 7) return dayNames[d.getDay()];
+                    return dayNames[d.getDay()].slice(0, 3) + ", " + monthNames[d.getMonth()] + " " + d.getDate();
+                }
+
+                function shortDay(t) {
+                    var d = new Date(t);
+                    var dd = Math.round((midnight(t) - midnight(now)) / day);
+                    if (dd === 0) return "Today";
+                    if (dd === 1) return "Tomorrow";
+                    return dayNames[d.getDay()].slice(0, 3) + " " + d.getDate();
+                }
+
+                // ---------- choosing what is next
+
+                // Upcoming events (not over yet), all-day ones after timed ones on the same day
+                function candidates(limitMs) {
+                    var out = [];
+                    var today = midnight(now);
+                    for (var i = 0; i < events.length; i++) {
+                        var ev = events[i];
+                        var keep = ev.e > now && ev.s < limitMs;
+                        if (keep && ev.a === 1 && showAllDay === false) keep = false;
+                        if (keep) out.push(ev);
+                    }
+                    out.sort(function(x, y) {
+                        var dx = Math.max(midnight(x.s), today), dy = Math.max(midnight(y.s), today);
+                        if (dx !== dy) return dx - dy;
+                        if (x.a !== y.a) return x.a - y.a;
+                        return x.s - y.s;
+                    });
+                    return out;
+                }
+
+                function setTile(t) {
+                    var d = new Date(t);
+                    tileDay = dayNames[d.getDay()].slice(0, 3).toUpperCase();
+                    tileDate = "" + d.getDate();
+                }
+
+                function anyCalendar() {
+                    return urls.length > 0;
+                }
+
+                function everRead() {
+                    for (var i = 0; i < urls.length; i++) {
+                        var c = byUrl[urls[i]];
+                        if (c && c.at > 0) return true;
+                    }
+                    return false;
+                }
+
+                function anyError() {
+                    for (var k = 0; k < urls.length; k++) {
+                        var f = byUrl[urls[k]];
+                        if (f && f.err) return true;
+                    }
+                    return false;
+                }
+
+                function recompute() {
+                    now = Date.now();
+                    var wd = new Date(now).getDay();
+                    shown = weekdaysOnly === false || (wd !== 0 && wd !== 6);
+
+                    // merge the saved events of the calendars in use
+                    var all = [];
+                    for (var i = 0; i < urls.length; i++) {
+                        var c = byUrl[urls[i]];
+                        if (c && c.events) all = all.concat(c.events);
+                    }
+                    events = all;
+
+                    var today = midnight(now);
+                    var horizon = today + lookDays * day;
+                    var list = candidates(horizon);
+                    coming = candidates(today + 31 * day).slice(0, 6);
+
+                    if (anyCalendar() === false) {
+                        setTile(now);
+                        line1 = "Up next";
+                        line2 = "Tap to add a calendar";
+                    } else if (everRead() === false) {
+                        setTile(now);
+                        line1 = "Up next";
+                        if (busy) line2 = "Reading your calendar…";
+                        else if (anyError()) line2 = "Can't reach the calendar · tap for details";
+                        else line2 = "Waiting for Wi-Fi to read your calendar";
+                    } else if (list.length === 0) {
+                        setTile(now);
+                        var later = candidates(today + 62 * day);
+                        line1 = lookDays === 1 ? "Nothing more today" : "Nothing ahead";
+                        if (later.length) line2 = "Clear until " + dayWord(later[0].s);
+                        else line2 = lookDays === 1 ? "Clear for the rest of the day" : "Clear for the next " + lookDays + " days";
+                    } else {
+                        var ev = list[0];
+                        var ongoing = ev.s <= now;
+                        setTile(ongoing ? now : ev.s);
+                        line1 = ev.t;
+                        var when;
+                        if (ev.a === 1) {
+                            var lastDay = ev.e - day;
+                            if (midnight(lastDay) > midnight(Math.max(ev.s, now))) {
+                                when = (ongoing ? "All day" : dayWord(ev.s)) + ", through " + dayNames[new Date(lastDay).getDay()];
+                            } else {
+                                when = dayWord(Math.max(ev.s, now)) + ", all day";
+                            }
+                        } else if (ongoing) {
+                            when = "Now, until " + (midnight(ev.e) === today ? clock(ev.e) : dayWord(ev.e) + " " + clock(ev.e));
+                        } else {
+                            when = dayWord(ev.s) + ", " + span(ev.s, ev.e);
+                        }
+                        line2 = when + (ev.l ? "  ·  " + ev.l : "");
+                    }
+                    scheduleTick(list);
+                }
+
+                // Next moment the header text can change: an event starting or ending, or midnight
+                function scheduleTick(list) {
+                    var next = midnight(now) + day + 1000;
+                    for (var i = 0; i < list.length && i < 20; i++) {
+                        if (list[i].s > now && list[i].s < next) next = list[i].s;
+                        if (list[i].e > now && list[i].e < next) next = list[i].e;
+                    }
+                    var wait = Math.max(30000, Math.min(next - now + 500, 1800000));
+                    upNextTick.interval = wait;
+                    upNextTick.restart();
+                }
+
+                // ---------- files
+
+                function readFile(name, cb) {
+                    var done = false;
+                    try {
+                        var req = new XMLHttpRequest();
+                        req.open("GET", dir + name);
+                        req.onreadystatechange = function() {
+                            if (req.readyState !== XMLHttpRequest.DONE || done) return;
+                            done = true;
+                            cb(req.responseText || "");
+                        };
+                        req.send();
+                    } catch (e) {
+                        log("read " + name + " threw: " + e);
+                        if (done === false) { done = true; cb(""); }
+                    }
+                }
+
+                function writeFile(name, text) {
+                    try {
+                        var req = new XMLHttpRequest();
+                        req.open("PUT", dir + name);
+                        req.send(text);
+                    } catch (e) {
+                        log("write " + name + " threw: " + e);
+                    }
+                }
+
+                function saveSettings() {
+                    writeFile("settings.json", JSON.stringify({ v: 1, urls: urls, weekdaysOnly: weekdaysOnly, lookDays: lookDays, showAllDay: showAllDay }));
+                }
+
+                function saveCache() {
+                    var keep = {};
+                    for (var i = 0; i < urls.length; i++) if (byUrl[urls[i]]) keep[urls[i]] = byUrl[urls[i]];
+                    writeFile("cache.json", JSON.stringify({ v: 1, byUrl: keep }));
+                }
+
+                function load() {
+                    readFile("settings.json", function(t1) {
+                        try {
+                            if (t1) {
+                                var s = JSON.parse(t1);
+                                if (s.urls && s.urls.length) upNext.urls = s.urls;
+                                upNext.weekdaysOnly = s.weekdaysOnly === true;
+                                if (s.lookDays === 1 || s.lookDays === 3 || s.lookDays === 7) upNext.lookDays = s.lookDays;
+                                upNext.showAllDay = s.showAllDay === false ? false : true;
+                            }
+                        } catch (e) {
+                            upNext.log("settings unreadable, using defaults: " + e);
+                        }
+                        upNext.readFile("cache.json", function(t2) {
+                            try {
+                                if (t2) {
+                                    var c = JSON.parse(t2);
+                                    if (c.byUrl) upNext.byUrl = c.byUrl;
+                                }
+                            } catch (e) {
+                                upNext.log("saved copy unreadable: " + e);
+                            }
+                            upNext.loaded = true;
+                            upNext.recompute();
+                            upNext.importLinks(true);
+                        });
+                    });
+                }
+
+                // links.txt: one link per line, added to the calendars and then emptied
+                function importLinks(thenRefresh) {
+                    readFile("links.txt", function(t) {
+                        var added = 0;
+                        var lines = String(t || "").split("\n");
+                        for (var i = 0; i < lines.length; i++) {
+                            var u = upNext.normalize(lines[i]);
+                            if (u && upNext.urls.indexOf(u) < 0) {
+                                upNext.urls = upNext.urls.concat([u]);
+                                added++;
+                            }
+                        }
+                        if (added) {
+                            upNext.log("added " + added + " calendar(s) from links.txt");
+                            upNext.writeFile("links.txt", "");
+                            upNext.saveSettings();
+                            upNext.recompute();
+                            upNext.refresh();
+                        } else if (thenRefresh) {
+                            upNext.autoRefresh(10 * 60000);
+                        }
+                    });
+                }
+
+                // ---------- settings changes
+
+                function normalize(raw) {
+                    var u = String(raw || "").replace(new RegExp("\\s+", "g"), "");
+                    if (u.length < 8) return "";
+                    var web = new RegExp("^webcals?://", "i");
+                    if (web.test(u)) u = "https://" + u.replace(web, "");
+                    else if (new RegExp("^[a-z]+://", "i").test(u) === false) u = "https://" + u;
+                    return u;
+                }
+
+                function addUrl(raw) {
+                    var u = normalize(raw);
+                    if (u === "") {
+                        status = "That doesn't look like a link";
+                        return false;
+                    }
+                    if (urls.indexOf(u) >= 0) {
+                        status = "That calendar is already here";
+                        return false;
+                    }
+                    urls = urls.concat([u]);
+                    saveSettings();
+                    status = "Added · reading " + hostOf(u) + "…";
+                    recompute();
+                    refresh();
+                    return true;
+                }
+
+                function removeUrl(u) {
+                    if (removeArm !== u) {
+                        removeArm = u;
+                        return;
+                    }
+                    removeArm = "";
+                    var keep = [];
+                    for (var i = 0; i < urls.length; i++) if (urls[i] !== u) keep.push(urls[i]);
+                    urls = keep;
+                    var copy = {};
+                    for (var k in byUrl) if (k !== u) copy[k] = byUrl[k];
+                    byUrl = copy;
+                    saveSettings();
+                    saveCache();
+                    status = "Removed";
+                    recompute();
+                }
+
+                function optRows() {
+                    return [
+                        { name: "show", label: "Show in the header", opts: [["every", "Every day"], ["weekdays", "Weekdays only"]] },
+                        { name: "look", label: "Look ahead", opts: [["1", "Today"], ["3", "3 days"], ["7", "A week"]] },
+                        { name: "allday", label: "All-day events", opts: [["show", "Show"], ["hide", "Hide"]] }
+                    ];
+                }
+
+                function optValue(name) {
+                    if (name === "show") return weekdaysOnly ? "weekdays" : "every";
+                    if (name === "look") return "" + lookDays;
+                    if (name === "allday") return showAllDay ? "show" : "hide";
+                    return "";
+                }
+
+                function setOpt(name, value) {
+                    if (name === "show") weekdaysOnly = value === "weekdays";
+                    else if (name === "look") lookDays = parseInt(value, 10);
+                    else if (name === "allday") showAllDay = value === "show";
+                    saveSettings();
+                    recompute();
+                }
+
+                function calName(u) {
+                    var c = byUrl[u];
+                    return (c && c.name) ? c.name : hostOf(u);
+                }
+
+                function calNote(u) {
+                    var c = byUrl[u];
+                    var cur = pending && pending.url === u;
+                    if (cur) return "Reading…";
+                    if (c === undefined || c === null) return "Not read yet";
+                    var parts = [];
+                    if (c.at > 0) {
+                        parts.push("Updated " + shortDay(c.at).replace("Today", "today") + " " + clock(c.at));
+                        parts.push((c.events ? c.events.length : 0) + " in the next two months");
+                    }
+                    if (c.err && (c.errAt || 0) >= (c.at || 0)) {
+                        parts.unshift(c.err);
+                        if (c.at > 0) parts[1] = "showing the copy from " + clock(c.at);
+                    }
+                    if (c.unknownZones && c.unknownZones.length) parts.push("time zone " + c.unknownZones[0] + " read as local");
+                    return parts.join(" · ");
+                }
+
+                // ---------- fetching
+
+                function autoRefresh(minAgeMs) {
+                    if (anyCalendar() === false || busy) return;
+                    if (typeof LinkProvider !== "undefined" && LinkProvider.isOnline === false) return;
+                    var newest = 0;
+                    for (var i = 0; i < urls.length; i++) {
+                        var c = byUrl[urls[i]];
+                        if (c && c.at > newest) newest = c.at;
+                    }
+                    var age = Math.min(Date.now() - newest, Date.now() - lastFetch);
+                    if (age < (minAgeMs || 0)) return;
+                    refresh();
+                }
+
+                function refresh() {
+                    if (busy) return;
+                    if (anyCalendar() === false) {
+                        status = "Add a calendar link below";
+                        return;
+                    }
+                    ensureWorker();
+                    lastFetch = Date.now();
+                    busy = true;
+                    queue = urls.slice(0);
+                    status = "Reading your calendar…";
+                    recompute();
+                    next();
+                }
+
+                function next() {
+                    if (queue.length === 0) {
+                        busy = false;
+                        pending = null;
+                        saveCache();
+                        var errs = 0;
+                        for (var i = 0; i < urls.length; i++) {
+                            var c = byUrl[urls[i]];
+                            if (c && c.err && (c.errAt || 0) >= (c.at || 0)) errs++;
+                        }
+                        status = errs ? (errs === urls.length ? "Couldn't update · showing the saved copy" : "Some calendars couldn't update")
+                                      : "Up to date · " + clock(Date.now());
+                        recompute();
+                        return;
+                    }
+                    var u = queue[0];
+                    queue = queue.slice(1);
+                    fetchOne(u);
+                }
+
+                function fail(u, reason) {
+                    log(hostOf(u) + ": " + reason);
+                    var old = byUrl[u] || { at: 0, events: [] };
+                    var copy = {};
+                    for (var k in byUrl) copy[k] = byUrl[k];
+                    copy[u] = { at: old.at || 0, name: old.name || "", events: old.events || [], total: old.total || 0, unknownZones: old.unknownZones || [], err: reason, errAt: Date.now() };
+                    byUrl = copy;
+                    pending = null;
+                    next();
+                }
+
+                function fetchOne(u) {
+                    reqSeq = reqSeq + 1;
+                    var seq = reqSeq;
+                    pending = { url: u, seq: seq, req: null };
+                    log("req " + seq + " GET " + hostOf(u));
+                    try {
+                        var req = new XMLHttpRequest();
+                        req.open("GET", u);
+                        req.onreadystatechange = function() {
+                            if (req.readyState !== XMLHttpRequest.DONE) return;
+                            if (upNext.pending === null || upNext.pending.seq !== seq) return;
+                            upNextWatchdog.stop();
+                            upNext.got(u, req);
+                        };
+                        pending.req = req;
+                        upNextWatchdog.restart();
+                        req.send();
+                    } catch (e) {
+                        upNextWatchdog.stop();
+                        fail(u, "Couldn't open the link");
+                    }
+                }
+
+                function timedOut() {
+                    var p = pending;
+                    if (p === null) return;
+                    pending = null;
+                    try { if (p.req) p.req.abort(); } catch (e) {}
+                    if (p.parsing) {
+                        // the worker never answered: read it here instead
+                        log("worker silent, parsing on the main thread");
+                        pending = p;
+                        parseHere(p.url, p.text);
+                        return;
+                    }
+                    fail(p.url, "No response");
+                }
+
+                function got(u, req) {
+                    var st = req.status;
+                    var text = req.responseText || "";
+                    log("req done " + hostOf(u) + " status " + st + ", " + text.length + " chars");
+                    if (st === 0) {
+                        var off = typeof LinkProvider !== "undefined" && LinkProvider.isOnline === false;
+                        fail(u, off ? "Offline" : "Can't reach " + hostOf(u));
+                        return;
+                    }
+                    if (st === 401 || st === 403 || st === 404) {
+                        fail(u, "Link not accepted (" + st + ")");
+                        return;
+                    }
+                    if (st < 200 || st >= 300) {
+                        fail(u, "Server error " + st);
+                        return;
+                    }
+                    if (text.indexOf("BEGIN:VCALENDAR") < 0) {
+                        fail(u, "Not a calendar feed");
+                        return;
+                    }
+                    parse(u, text);
+                }
+
+                function parse(u, text) {
+                    var t = Date.now();
+                    var msg = { id: pending.seq, url: u, text: text, from: midnight(t) - day, to: midnight(t) + 62 * day, max: 300 };
+                    if (worker && worker.ready) {
+                        pending.parsing = true;
+                        pending.text = text;
+                        upNextWatchdog.restart();
+                        worker.sendMessage(msg);
+                        return;
+                    }
+                    parseHere(u, text);
+                }
+
+                // Fallback: same reader, run on this thread (brief pause on very large feeds)
+                function parseHere(u, text) {
+                    var go = function() {
+                        if (upNext.parseFn === null) {
+                            upNext.fail(u, "Calendar reader missing");
+                            return;
+                        }
+                        var t = Date.now();
+                        var reply = { url: u, ok: false };
+                        try {
+                            var r = upNext.parseFn(text, upNext.midnight(t) - upNext.day, upNext.midnight(t) + 62 * upNext.day, 300);
+                            reply.ok = true;
+                            reply.name = r.name;
+                            reply.events = r.events;
+                            reply.total = r.total;
+                            reply.unknownZones = r.unknownZones;
+                        } catch (e) {
+                            reply.error = "" + e;
+                        }
+                        upNext.parsed(reply);
+                    };
+                    if (parseFn) { go(); return; }
+                    readFile("ical.js", function(src) {
+                        try {
+                            if (src) upNext.parseFn = new Function("UPNEXT_MAIN_THREAD", src + "\nreturn upcoming;")(true);
+                        } catch (e) {
+                            upNext.log("reader failed to load: " + e);
+                        }
+                        go();
+                    });
+                }
+
+                function parsed(reply) {
+                    var p = pending;
+                    if (p === null || p.url !== reply.url) return;
+                    upNextWatchdog.stop();
+                    if (reply.ok === false) {
+                        log("parse error: " + reply.error);
+                        fail(p.url, "Couldn't read the calendar");
+                        return;
+                    }
+                    log(hostOf(p.url) + ": " + reply.total + " entries, " + reply.events.length + " upcoming");
+                    var copy = {};
+                    for (var k in byUrl) copy[k] = byUrl[k];
+                    copy[p.url] = { at: Date.now(), name: reply.name || "", events: reply.events, total: reply.total, unknownZones: reply.unknownZones || [], err: "", errAt: 0 };
+                    byUrl = copy;
+                    pending = null;
+                    next();
+                }
+
+                function ensureWorker() {
+                    if (worker) return;
+                    var heads = ["import QtQml.WorkerScript\n", "import QtQuick\n"];
+                    for (var i = 0; i < heads.length && worker === null; i++) {
+                        try {
+                            worker = Qt.createQmlObject(heads[i] + "WorkerScript { source: \"" + dir + "ical.js\" }", upNext, "upNextWorker");
+                        } catch (e) {
+                            log("WorkerScript unavailable (" + i + "): " + e);
+                        }
+                    }
+                    if (worker) {
+                        worker.message.connect(function(m) { upNext.parsed(m); });
+                        log("worker created");
+                    }
+                }
+
+                // ---------- the calendar link field (on-screen keyboard)
+
+                function makeInput(box) {
+                    var specs = [
+                        "import QtQuick\nimport xofm.libs.controls 1.0\nGeneralTextInput {}",
+                        "import QtQuick\nTextInput {}"
+                    ];
+                    var obj = null;
+                    for (var i = 0; i < specs.length && obj === null; i++) {
+                        try {
+                            obj = Qt.createQmlObject(specs[i], box, "upNextInput");
+                        } catch (e) {
+                            log("text field " + i + " unavailable: " + e);
+                        }
+                    }
+                    if (obj === null) return null;
+                    obj.anchors.fill = box;
+                    obj.anchors.leftMargin = 20;
+                    obj.anchors.rightMargin = 20;
+                    obj.verticalAlignment = TextInput.AlignVCenter;
+                    obj.font.pixelSize = 26;
+                    obj.color = "black";
+                    obj.clip = true;
+                    try { obj.selectionColor = "black"; obj.selectedTextColor = "white"; } catch (e2) {}
+                    try { obj.inputMethodHints = Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase | Qt.ImhUrlCharactersOnly; } catch (e3) {}
+                    obj.accepted.connect(function() {
+                        if (upNext.addUrl(obj.text)) obj.text = "";
+                    });
+                    return obj;
+                }
+
+                function closeMenu() {
+                    menuOpen = false;
+                    removeArm = "";
+                    try {
+                        if (upNextInputBox.input) upNextInputBox.input.focus = false;
+                    } catch (e) {}
+                }
+
+                function openMenu() {
+                    removeArm = "";
+                    status = busy ? "Reading your calendar…" : "";
+                    recompute();
+                    menuOpen = true;
+                    importLinks(false);
+                }
+
+                Component.onCompleted: {
+                    now = Date.now();
+                    setTile(now);
+                    load();
+                    ensureWorker();
+                }
+
+                // ---------- timers and signals
+
+                // Re-picks "next" when an event starts or ends, and at midnight
+                Timer {
+                    id: upNextTick
+                    interval: 60000
+                    repeat: false
+                    onTriggered: upNext.recompute()
+                }
+
+                // A download (60 s) or the worker (60 s) went silent
+                Timer {
+                    id: upNextWatchdog
+                    interval: 60000
+                    repeat: false
+                    onTriggered: upNext.timedOut()
+                }
+
+                Timer {
+                    interval: 3600000
+                    running: true
+                    repeat: true
+                    onTriggered: upNext.autoRefresh(50 * 60000)
+                }
+
+                Timer {
+                    id: upNextOnline
+                    interval: 2500
+                    repeat: false
+                    onTriggered: upNext.autoRefresh(15 * 60000)
+                }
+
+                Connections {
+                    target: LinkProvider
+                    function onIsOnlineChanged() {
+                        if (LinkProvider.isOnline) upNextOnline.restart();
+                    }
+                }
+
+                Connections {
+                    target: BatteryManager
+                    function onDisplayStateChanged(previous, next) {
+                        var wasAsleep = previous === BatteryManager.DeepSleep || previous === BatteryManager.LightSleep;
+                        if (wasAsleep && next === BatteryManager.Normal) {
+                            upNext.recompute();
+                            upNextOnline.restart();
+                        }
+                    }
+                }
+
+                // ---------- header item
+
+                function leftEdge() {
+                    var x = 140;
+                    try { x = menuButton.x + menuButton.width + 20; } catch (e) {}
+                    try {
+                        if (fieldWeatherNow) x = fieldWeatherNow.x + fieldWeatherNow.width + 4;
+                    } catch (e2) {}
+                    return x;
+                }
+
+                function rightEdge() {
+                    var r = header.width - 220;
+                    try {
+                        var s = header.topStatusIndication;
+                        if (s) r = s.x - 32;
+                    } catch (e) {}
+                    return r;
+                }
+
+                Item {
+                    id: upNextChip
+                    x: { return upNext.leftEdge(); }
+                    width: { return Math.max(260, Math.min(700, upNext.rightEdge() - x)); }
+                    height: parent.height
+
+                    Item {
+                        anchors.fill: parent
+                        visible: upNext.shown
+
+                        Rectangle {
+                            id: upNextRule
+                            x: 0
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 2
+                            height: 64
+                            color: "black"
+                        }
+
+                        Column {
+                            id: upNextTile
+                            x: 28
+                            width: 62
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: -4
+
+                            Text {
+                                width: parent.width
+                                horizontalAlignment: Text.AlignHCenter
+                                text: upNext.tileDay
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 19
+                                font.weight: Font.DemiBold
+                                font.letterSpacing: 2
+                            }
+
+                            Text {
+                                width: parent.width
+                                horizontalAlignment: Text.AlignHCenter
+                                text: upNext.tileDate
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 46
+                                font.weight: Font.Medium
+                            }
+                        }
+
+                        Column {
+                            anchors.left: upNextTile.right
+                            anchors.leftMargin: 22
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 0
+
+                            Text {
+                                width: parent.width
+                                elide: Text.ElideRight
+                                text: upNext.line1
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 33
+                                font.weight: Font.DemiBold
+                            }
+
+                            Text {
+                                width: parent.width
+                                elide: Text.ElideRight
+                                text: upNext.line2
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 25
+                                font.weight: Font.Medium
+                            }
+                        }
+                    }
+
+                    // Still tappable when hidden on a weekend, so the menu is never lost
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: upNext.openMenu()
+                    }
+                }
+
+                // ---------- menu, drawn over the file grid
+
+                Rectangle {
+                    id: upNextMenu
+                    parent: header.parent
+                    visible: upNext.menuOpen
+                    z: 1000
+                    x: 0
+                    y: header.height
+                    width: header.width
+                    height: upNextMenuCol.implicitHeight + 112
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Column {
+                        id: upNextMenuCol
+                        x: 64
+                        y: 52
+                        width: parent.width - 128
+                        spacing: 30
+
+                        Item {
+                            width: parent.width
+                            height: 56
+
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "Up next"
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 48
+                                font.weight: Font.Medium
+                            }
+
+                            Text {
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "Close"
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 30
+                                font.weight: Font.DemiBold
+                                MouseArea {
+                                    anchors.fill: parent
+                                    anchors.margins: -24
+                                    onClicked: upNext.closeMenu()
+                                }
+                            }
+                        }
+
+                        Text {
+                            visible: upNext.shown === false
+                            width: parent.width
+                            wrapMode: Text.WordWrap
+                            text: "Resting today, as it's the weekend. The header spot still opens this menu."
+                            color: "black"
+                            font.family: upNext.serif
+                            font.pixelSize: 25
+                            font.italic: true
+                        }
+
+                        // ---- coming up
+                        Column {
+                            width: parent.width
+                            spacing: 0
+                            visible: upNext.anyCalendar()
+
+                            Text {
+                                text: "COMING UP"
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 20
+                                font.weight: Font.DemiBold
+                                font.letterSpacing: 3
+                                bottomPadding: 10
+                            }
+
+                            Repeater {
+                                model: upNext.coming
+                                delegate: Item {
+                                    width: parent.width
+                                    height: 58
+
+                                    Rectangle {
+                                        width: parent.width
+                                        height: 1
+                                        color: "black"
+                                    }
+
+                                    Text {
+                                        x: 0
+                                        width: 200
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: upNext.shortDay(Math.max(modelData.s, upNext.now))
+                                        color: "black"
+                                        font.family: upNext.serif
+                                        font.pixelSize: 26
+                                        font.weight: Font.DemiBold
+                                    }
+
+                                    Text {
+                                        x: 200
+                                        width: 250
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: { return modelData.a === 1 ? "all day" : upNext.clock(modelData.s); }
+                                        color: "black"
+                                        font.family: upNext.serif
+                                        font.pixelSize: 26
+                                        font.italic: true
+                                    }
+
+                                    Text {
+                                        x: 450
+                                        width: parent.width - 450
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        elide: Text.ElideRight
+                                        text: { return modelData.t + (modelData.l ? "  ·  " + modelData.l : ""); }
+                                        color: "black"
+                                        font.family: upNext.serif
+                                        font.pixelSize: 26
+                                    }
+                                }
+                            }
+
+                            Text {
+                                visible: upNext.coming.length === 0
+                                topPadding: 8
+                                text: "Nothing in the next month."
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 26
+                                font.italic: true
+                            }
+
+                            Rectangle {
+                                width: parent.width
+                                height: 1
+                                color: "black"
+                            }
+                        }
+
+                        // ---- choices
+                        Column {
+                            width: parent.width
+                            spacing: 18
+
+                            Repeater {
+                                model: upNext.optRows()
+                                delegate: Item {
+                                    id: upNextOptRow
+                                    width: parent.width
+                                    height: 64
+                                    property var row: modelData
+
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: upNextOptRow.row.label
+                                        color: "black"
+                                        font.family: upNext.serif
+                                        font.pixelSize: 30
+                                    }
+
+                                    Row {
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: -2
+
+                                        Repeater {
+                                            model: upNextOptRow.row.opts
+                                            delegate: Rectangle {
+                                                property bool picked: upNext.optValue(upNextOptRow.row.name) === modelData[0]
+                                                width: 210
+                                                height: 60
+                                                color: { return picked ? "black" : "white"; }
+                                                border.color: "black"
+                                                border.width: 2
+
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    text: modelData[1]
+                                                    color: { return parent.picked ? "white" : "black"; }
+                                                    font.family: upNext.serif
+                                                    font.pixelSize: 26
+                                                    font.weight: Font.Medium
+                                                }
+
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    onClicked: upNext.setOpt(upNextOptRow.row.name, modelData[0])
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            width: parent.width
+                            height: 1
+                            color: "black"
+                        }
+
+                        // ---- calendars
+                        Column {
+                            width: parent.width
+                            spacing: 14
+
+                            Text {
+                                text: "CALENDARS"
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 20
+                                font.weight: Font.DemiBold
+                                font.letterSpacing: 3
+                            }
+
+                            Repeater {
+                                model: upNext.urls
+                                delegate: Item {
+                                    width: parent.width
+                                    height: 76
+
+                                    Column {
+                                        width: parent.width - 220
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: 2
+
+                                        Text {
+                                            width: parent.width
+                                            elide: Text.ElideRight
+                                            text: upNext.calName(modelData)
+                                            color: "black"
+                                            font.family: upNext.serif
+                                            font.pixelSize: 30
+                                            font.weight: Font.Medium
+                                        }
+
+                                        Text {
+                                            width: parent.width
+                                            elide: Text.ElideRight
+                                            text: upNext.calNote(modelData)
+                                            color: "black"
+                                            font.family: upNext.serif
+                                            font.pixelSize: 22
+                                            font.italic: true
+                                        }
+                                    }
+
+                                    Text {
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: { return upNext.removeArm === modelData ? "Tap again to remove" : "Remove"; }
+                                        color: "black"
+                                        font.family: upNext.serif
+                                        font.pixelSize: 26
+                                        font.weight: Font.DemiBold
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            anchors.margins: -20
+                                            onClicked: upNext.removeUrl(modelData)
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                id: upNextInputBox
+                                width: parent.width
+                                height: 76
+                                color: "white"
+                                border.color: "black"
+                                border.width: 2
+                                property var input: null
+
+                                Text {
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: 20
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    visible: { return upNextInputBox.input === null || upNextInputBox.input.text === ""; }
+                                    text: "Add a calendar: type its .ics or webcal:// link, then Enter"
+                                    color: "#555555"
+                                    font.family: upNext.serif
+                                    font.pixelSize: 25
+                                    font.italic: true
+                                }
+
+                                Component.onCompleted: input = upNext.makeInput(upNextInputBox)
+                            }
+
+                            Text {
+                                width: parent.width
+                                wrapMode: Text.WordWrap
+                                text: "Google Calendar: Settings › your calendar › Secret address in iCal format. Links can also go in links.txt in /home/root/.local/share/upnext/, one per line."
+                                color: "#555555"
+                                font.family: upNext.serif
+                                font.pixelSize: 22
+                            }
+                        }
+
+                        Item {
+                            width: parent.width
+                            height: 52
+
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: parent.width - 260
+                                elide: Text.ElideRight
+                                text: upNext.status
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 25
+                                font.italic: true
+                            }
+
+                            Text {
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "Refresh now"
+                                color: "black"
+                                font.family: upNext.serif
+                                font.pixelSize: 30
+                                font.weight: Font.DemiBold
+                                MouseArea {
+                                    anchors.fill: parent
+                                    anchors.margins: -24
+                                    onClicked: upNext.refresh()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    END TRAVERSE
+
+END AFFECT

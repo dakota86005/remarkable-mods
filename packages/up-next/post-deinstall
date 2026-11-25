@@ -1,0 +1,7 @@
+#!/bin/sh
+if [ "$VELLUM_PURGE" = "1" ]; then
+	rm -f /home/root/.local/share/upnext/settings.json /home/root/.local/share/upnext/cache.json /home/root/.local/share/upnext/links.txt
+	rmdir /home/root/.local/share/upnext 2>/dev/null
+fi
+@RESTART@
+exit 0
