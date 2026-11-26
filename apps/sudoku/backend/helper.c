@@ -105,12 +105,13 @@ static void send_stroke(int eraser) {
     say(MSG_STROKE, text);
 }
 
-static int rubber_now(int fd) {
+static int key_now(int fd, int code) {
     unsigned long keys[(KEY_MAX / (8 * sizeof(long))) + 1];
     memset(keys, 0, sizeof keys);
     if (ioctl(fd, EVIOCGKEY(sizeof keys), keys) < 0) return 0;
-    return has_bit(keys, BTN_TOOL_RUBBER);
+    return has_bit(keys, code);
 }
+static int rubber_now(int fd) { return key_now(fd, BTN_TOOL_RUBBER); }
 
 int main(int argc, char **argv) {
     struct sockaddr_un addr;
@@ -136,10 +137,11 @@ int main(int argc, char **argv) {
             dev = open_marker(name, sizeof name);
             if (dev >= 0) {
                 char st[96];
-                read_ranges(dev); rubber = rubber_now(dev); touch = was = 0; np = 0; have = 0;
+                read_ranges(dev); rubber = rubber_now(dev); tip = key_now(dev, BTN_TOOL_PEN); touch = was = 0; np = 0; have = 0;
+                near = (tip || rubber) ? 1 : 0;
                 snprintf(st, sizeof st, "%s %dx%d", name, max_x, max_y);
                 snprintf(name, sizeof name, "%s", st);
-                say(MSG_STATUS, name); say(MSG_ERASER, rubber ? "1" : "0");
+                say(MSG_STATUS, name); say(MSG_ERASER, rubber ? "1" : "0"); say(MSG_NEAR, near ? "1" : "0");
             }
             else { say(MSG_STATUS, "no Marker device"); idle = 5; }
         }
@@ -154,6 +156,7 @@ int main(int argc, char **argv) {
             static char body[65536];
             int head[2] = { 0, 0 };
             ssize_t got = recv(sock, head, sizeof head, 0);
+            if (got < 0 && (errno == EINTR || errno == EAGAIN)) continue;
             if (got < (ssize_t) sizeof head) return 0;
             if (head[1] > 0 && recv(sock, body, sizeof body, MSG_TRUNC) < 0) return 0;
             if (head[0] == SYS_TERMINATE) return 0;
@@ -194,10 +197,13 @@ int main(int argc, char **argv) {
                     } else if (code == BTN_TOOL_PEN) tip = value ? 1 : 0;
                     else if (code == BTN_TOUCH) touch = value ? 1 : 0;
                 } else if (type == EV_SYN && code == SYN_DROPPED) {
-                    /* Events were lost: drop the stroke in progress rather than guess. */
+                    /* Events were lost: ask the device where things stand. */
                     int now = rubber_now(dev);
                     if (now != rubber) { rubber = now; say(MSG_ERASER, rubber ? "1" : "0"); }
-                    touch = was = 0; np = 0; tip = 0;
+                    /* The stroke so far is still true; whether it goes on is read from the device. */
+                    tip = key_now(dev, BTN_TOOL_PEN); touch = key_now(dev, BTN_TOUCH);
+                    if (!touch && was) { was = 0; if (np > 0) send_stroke(stroke_rubber); np = 0; }
+                    now = (tip || rubber || touch) ? 1 : 0;
                     if (near != now) { near = now; say(MSG_NEAR, near ? "1" : "0"); }
                 } else if (type == EV_SYN && code == SYN_REPORT) {
                     int reach = (tip || rubber || touch) ? 1 : 0;
